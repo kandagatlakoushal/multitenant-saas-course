@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capstone: testing isolation</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 13 of 13 · Day 4 · ~75 min (60-min capstone) · <a href="../MISSION.html">Mission</a></p>
+<h1>Capstone: testing isolation</h1>
+<p class="win"><strong>Your win:</strong> a one-page conversion checklist for three real services, and a plan of 10 isolation tests that would catch every leak from this course.</p>
+
+<section class="recall">
+<h2>Recall first (3 min)</h2>
+<ol><li>Give the onboarding steps in order.</li><li>Name three places outside the database where the tenant must be in the key.</li></ol>
+<details><summary>Check</summary><ol><li>Registry entry as PROVISIONING, then schema and migrations, queues and authorization, config and users, ACTIVE, smoke test. (<a href="0012-noisy-neighbours-observability-lifecycle.html">Lesson 12</a>)</li><li>Any three of: caches, locks, counters, de-duplication stores, static maps, message group IDs. (<a href="0007-caches-locks-and-maps.html">Lesson 7</a>, <a href="0008-shards-and-one-way-doors.html">Lesson 8</a>)</li></ol></details>
+</section>
+
+<h2>Four kinds of isolation test</h2>
+<pre class="diagram">
+ LEAK          tenants A and B with the SAME business keys -> each sees only its own data
+ FORGED HEADER log in as A, send X-Tenant-Id: B            -> 400, nothing of B
+ MISSING       no tenant on message/request                -> DLQ / 4xx, nothing written
+ CONCURRENCY   1-thread pool, alternate A,B,A,B            -> context never stale
+</pre>
+<p>Use real PostgreSQL (<a href="https://java.testcontainers.org/modules/databases/postgres/">Testcontainers</a>), not H2. The point is PostgreSQL's real <code>search_path</code>, RLS and temp-table behaviour.</p>
+<pre><code>@Test
+void sameBusinessKeyInTwoTenantsNeverCrosses() {
+    as("acme",  () -&gt; trades.save(new Trade("10001", "ACME-DATA")));
+    as("hooli", () -&gt; trades.save(new Trade("10001", "HOOLI-DATA")));
+    assertThat(as("acme",  () -&gt; trades.findByAccountNo("10001"))).extracting(Trade::payload).containsExactly("ACME-DATA");
+    assertThat(as("hooli", () -&gt; trades.findByAccountNo("10001"))).extracting(Trade::payload).containsExactly("HOOLI-DATA");
+}
+
+@Test
+void asyncWorkSeesSubmittersTenant() throws Exception {
+    ThreadPoolTaskExecutor ex = new ThreadPoolTaskExecutor();
+    ex.setCorePoolSize(1); ex.setMaxPoolSize(1);          // force reuse every time
+    ex.setTaskDecorator(new TenantTaskDecorator()); ex.initialize();
+    for (String t : List.of("acme", "hooli", "acme", "hooli"))
+        assertThat(as(t, () -&gt; ex.submit(TenantContext::require).get())).isEqualTo(t);
+}</code></pre>
+<p>Add <a href="https://www.archunit.org/">ArchUnit</a> rules that ban <code>new RestTemplate()</code>, <code>WebClient.create()</code>, <code>parallelStream()</code>, <code>@Value("${customer.</code>, and static mutable maps. They catch earlier lessons' traps at build time.</p>
+
+<h2>Capstone (60 min)</h2>
+<p><strong>Part A (35 min): conversion checklist.</strong> For each service, cover the boundary, propagation in and out, data access, shared state, config, flag and conditions, failure behaviour, and observability.</p>
+<ol>
+<li><strong>Parser:</strong> stateless. Consumes <code>PARSE.*</code>, publishes <code>ENRICH.*</code>. Uses <code>@Value("${customer.date-format}")</code>.</li>
+<li><strong>Enricher:</strong> REST calls to reference data; an instrument cache keyed by ISIN; a <code>@Scheduled</code> counterparty reload; <code>CompletableFuture</code> for two parallel calls.</li>
+<li><strong>UI gateway:</strong> OIDC login, calls the reporter, reads <code>X-Customer</code> from the browser for an admin view.</li>
+</ol>
+<p><strong>Part B (25 min): 10 isolation tests.</strong> For each: name, setup, action, expected result, and the leak it catches.</p>
+
+<details><summary>Worked answer: Part A</summary>
+<p><strong>Common (the starter provides):</strong> a typed boolean flag with class-level conditions; <code>TenantContext</code> plus MDC; a validated registry accepting only ACTIVE tenants; routing (no default target, not lenient) feeding the switch-on-borrow wrapper; a registered context accessor and task decorator; client customizers plus ArchUnit; a <code>MeterFilter</code> allow-list.</p>
+<p><strong>Parser:</strong> listeners registered from the registry; <code>requireKnown</code>, set, clear in <code>finally</code>; <code>destination(stage, tenant)</code> and copy <code>tenantId</code> on send; group ID <code>tenantId:accountNo</code>; date format from <code>TenantSettings</code> with a per-tenant formatter cache; unknown tenant or parse error throws, retries a few times, goes to the DLQ with its <code>tenantId</code>; messages and errors metrics by tenant.</p>
+<p><strong>Enricher:</strong> the same boundary; the reference-data client built from the builder; <code>CompletableFuture</code> given a propagating executor (or made sequential); cache key <code>(tenant, isin)</code> with the loader setting the context from the key; the scheduler loops over tenants with one transaction each and keeps old data on failure; reference-data 4xx goes to the DLQ, 5xx retries, and there is never a fallback to another tenant's data.</p>
+<p><strong>Gateway:</strong> remove <code>X-Customer</code> (client tenant headers get 400 and a metric); <code>TenantResolutionFilter</code> after authentication, not a bean; admin switching by allow-list, audited and stored in the session; outbound header through the builder; tenant-scoped lookups returning 404; a per-tenant rate limit returning 429.</p>
+</details>
+<details><summary>Worked answer: Part B</summary>
+<table>
+<tr><th>#</th><th>Test</th><th>Expected</th><th>Catches</th></tr>
+<tr><td>1</td><td>Parser leak: A and B both send account <code>10001</code></td><td>Each output only in its own flow and schema</td><td>Wrong path, property not copied</td></tr>
+<tr><td>2</td><td>Parser: message with no tenant</td><td>DLQ after retries; nothing written</td><td>Default tenant</td></tr>
+<tr><td>3</td><td>Parser: <code>tenantId=ghost</code></td><td>DLQ; no DB borrow</td><td>Missing registry check</td></tr>
+<tr><td>4</td><td>Parser config: A <code>dd/MM</code>, B <code>MM/dd</code>, input <code>03/04/2026</code></td><td>A → 3 April, B → 4 March</td><td>Startup-frozen config</td></tr>
+<tr><td>5</td><td>Enricher header (WireMock): A then B</td><td>Every call carries the matching <code>X-Tenant-Id</code></td><td><code>new RestTemplate()</code>, lost hop</td></tr>
+<tr><td>6</td><td>Enricher cache: same ISIN, different data</td><td>B gets B's data; two upstream calls</td><td>Key without tenant</td></tr>
+<tr><td>7</td><td>Enricher scheduled reload</td><td>Per-tenant maps differ; failure keeps old data</td><td>Scheduler with no tenant</td></tr>
+<tr><td>8</td><td>One-thread executor A,B,A,B</td><td>Each task sees its submitter's tenant</td><td>Missing decorator or clear</td></tr>
+<tr><td>9</td><td>BFF forged <code>X-Tenant-Id</code> / <code>X-Customer</code></td><td>400; metric; reporter not called</td><td>Lenient filter</td></tr>
+<tr><td>10</td><td>BFF: A requests B's trade 9001</td><td>404; reporter called with <code>X-Tenant-Id: A</code></td><td>Object IDOR</td></tr>
+</table>
+<p>Also worth adding: a missing-schema test (ACTIVE tenant whose schema is absent: the query errors and never reads <code>public</code>), and a user with no tenant mapping getting 403.</p>
+</details>
+
+<h2>Final interleaved review</h2>
+<script type="application/json" class="quiz-data">
+[
+ {"q": "(Day 1) Where does a property condition that switches a JMS listener off actually work?",
+  "options": ["On the annotated @JmsListener method itself", "On the listener container factory call", "On the component class holding listeners", "On the JMS message selector expression"],
+  "answer": 2, "why": "Conditions are evaluated on component classes and @Bean methods, not on listener methods."},
+ {"q": "(Day 2) Why use real PostgreSQL rather than H2 in isolation tests?",
+  "options": ["H2 allows only two schemas total", "search_path and RLS differ in H2", "Testcontainers offers no module for H2", "H2 has no support for transactions"],
+  "answer": 1, "why": "The leaks you are testing for depend on PostgreSQL's exact search_path, RLS and temp-table behaviour."},
+ {"q": "(Day 3) What pool size best exposes ThreadLocal leaks in a concurrency test?",
+  "options": ["Many threads, to raise the contention", "One thread for each tenant tested", "Unbounded, the same as in production", "One thread, so reuse always happens"],
+  "answer": 3, "why": "A single thread is reused by every task, so a missing clear or decorator fails every time instead of occasionally."},
+ {"q": "(Day 4) Logged in as A, the browser sends X-Tenant-Id: B. What does the forged-header test expect?",
+  "options": ["200, but filtered to tenant A", "400, and nothing of tenant B", "302, redirecting back to the login", "500, from a failed tenant lookup"],
+  "answer": 1, "why": "Reject client tenant input loudly, count it, and never call downstream services with B."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html">AWS: SaaS Tenant Isolation Strategies</a> again, now that you can map each strategy to a test. Then take one hard question to a community in <a href="../RESOURCES.html">RESOURCES.md</a> (for example pgsql-general on <code>search_path</code> with pooling). That is where wisdom comes from.</p>
+
+<p class="ask">Ask me to review your checklist and test plan. Paste them in and I'll mark gaps against every lesson.</p>
+
+<nav class="pager"><span><a href="0012-noisy-neighbours-observability-lifecycle.html">← Operations</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="../index.html">Course index</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

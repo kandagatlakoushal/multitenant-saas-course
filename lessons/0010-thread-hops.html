@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thread hops and outbound calls</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 10 of 13 · Day 3 · ~30 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Thread hops and outbound calls</h1>
+<p class="win"><strong>Your win:</strong> mark every <a href="../reference/glossary.html#thread-hop">thread hop</a> in a service, fix each one, and make every REST client carry <code>X-Tenant-Id</code>.</p>
+
+<section class="recall">
+<h2>Recall first (3 min): interleaved</h2>
+<ol><li>What should the DLQ replay tool do with <code>tenantId</code>?</li><li>Why does a loop over tenants inside one <code>@Transactional</code> method leak?</li><li>What must <code>JMSXGroupID</code> include in a shared queue?</li></ol>
+<details><summary>Check</summary><ol><li>Keep the original and re-validate it. (<a href="0009-dlq-and-broadcast-messages.html">Lesson 9</a>)</li><li>One connection and one <code>search_path</code> for the whole transaction. (<a href="0005-search-path-traps.html">Lesson 5</a>)</li><li>The tenant, e.g. <code>tenantId:accountNo</code>. (<a href="0008-shards-and-one-way-doors.html">Lesson 8</a>)</li></ol></details>
+</section>
+
+<h2>Where the <code>ThreadLocal</code> is lost</h2>
+<pre class="diagram">
+ listener thread [tenant=acme]
+   |- @Async                        -> task executor      [?]  lost / stale
+   |- executor.submit(...)          -> pool thread        [?]  lost / stale
+   |- CompletableFuture.supplyAsync -> common pool        [?]  lost
+   |- parallelStream()              -> common pool        [?]  sometimes
+   |- cache refreshAfterWrite       -> cache executor     [?]  lost
+   |- publishOn / subscribeOn       -> Reactor scheduler  [?]  lost
+   (@Scheduled tick: a boundary with NO tenant at all)
+</pre>
+<p>"Stale" is worse than lost. A pooled worker keeps whatever tenant was last set on it. Propagation always means: capture, set, run, then clear in <code>finally</code>.</p>
+
+<h2>Three fixes</h2>
+<h3>1. <a href="../reference/glossary.html#task-decorator"><code>TaskDecorator</code></a> (executors and <code>@Async</code>)</h3>
+<pre><code>public Runnable decorate(Runnable task) {
+    String captured = TenantContext.current().orElse(null);        // on the submitting thread
+    return () -&gt; {
+        String previous = TenantContext.current().orElse(null);    // non-null only if run on the caller
+        TenantContext.clear();                                      // never trust a pooled worker
+        try { if (captured != null) TenantContext.set(captured); task.run(); }
+        finally { TenantContext.clear(); if (previous != null) TenantContext.set(previous); }
+    };
+}</code></pre>
+<p>Boot applies a <code>TaskDecorator</code> bean to its auto-configured executor <span class="unverified">⚠ verify for your Boot version</span>. Executors you build yourself need <code>setTaskDecorator</code>. A bare <code>Executors.newFixedThreadPool</code> gets nothing. <span class="cite"><a href="https://docs.spring.io/spring-framework/reference/integration/scheduling.html">Spring: Task Execution and Scheduling</a>.</span></p>
+<h3>2. Micrometer context propagation</h3>
+<pre><code>ContextRegistry.getInstance().registerThreadLocalAccessor("tenantId",
+    () -&gt; TenantContext.current().orElse(null), TenantContext::set, TenantContext::clear);
+// then: new ContextPropagatingTaskDecorator()   (Spring 6.1+), or ContextExecutorService.wrap(executor)</code></pre>
+<p class="cite"><a href="https://docs.micrometer.io/context-propagation/reference/">Micrometer Context Propagation</a>.</p>
+<h3>3. Reactor</h3>
+<p>Write the tenant into the Reactor Context with <code>.contextWrite(Context.of("tenantId", TenantContext.require()))</code>. Turn on automatic propagation (<code>Hooks.enableAutomaticContextPropagation()</code>, Reactor 3.5.3+) so the registered <code>ThreadLocal</code> is restored around operators. <span class="cite"><a href="https://projectreactor.io/docs/core/release/reference/">Reactor reference: context propagation</a>.</span></p>
+<p><strong>Rules:</strong> always pass an executor to <code>CompletableFuture</code>. Avoid <code>parallelStream()</code>. <code>InheritableThreadLocal</code> copies only when a thread is created, so it doesn't help with pools. <code>@Scheduled</code> jobs loop over tenants explicitly. Cache loaders set the context <em>from the key</em>.</p>
+
+<h2>Outbound: put the header on the builder</h2>
+<table>
+<tr><th>Client</th><th>Shared hook</th><th>Bypass that loses the header</th></tr>
+<tr><td><code>RestTemplate</code></td><td><code>RestTemplateBuilder</code> + customizer</td><td><code>new RestTemplate()</code></td></tr>
+<tr><td><code>RestClient</code></td><td><code>RestClient.Builder</code> bean</td><td><code>RestClient.create()</code></td></tr>
+<tr><td><code>WebClient</code></td><td><code>WebClient.Builder</code> bean + filter</td><td><code>WebClient.create()</code></td></tr>
+<tr><td>OpenFeign</td><td><code>RequestInterceptor</code> bean</td><td><code>Feign.builder()</code> without it</td></tr>
+</table>
+<p class="cite"><a href="https://docs.spring.io/spring-boot/reference/io/rest-client.html">Spring Boot: Calling REST services</a>.</p>
+
+<h2>Practice (12 min)</h2>
+<h3>The cache-reloading scheduler</h3>
+<pre><code>@Scheduled(fixedDelay = 600_000)
+void reload() { byIsin = ratingsRepo.findAll().stream().collect(toMap(Rating::isin, r -&gt; r)); }
+Rating get(String isin) { return byIsin.get(isin); }</code></pre>
+<p>What happens (a) with our fail-closed data source, and (b) with a "default schema" added? How would you rewrite it?</p>
+<details><summary>Worked answer</summary>
+<p>(a) No tenant on the scheduler thread, so <code>require()</code> throws on every reload. The map stays empty forever: no leak, but a silent outage. (b) One schema's ratings are served to every tenant, with no errors. Both versions also key by ISIN only.</p>
+<p>Rewrite: a map of <code>tenant → (isin → rating)</code>. <code>reload()</code> loops over active tenants, setting and clearing the context for each, keeps a tenant's old entry if its reload fails, and drops offboarded tenants. <code>get</code> looks up <code>TenantContext.require()</code> first.</p></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "A service builds its client with new RestTemplate(). A RestTemplateCustomizer bean adds X-Tenant-Id. What is sent?",
+  "options": ["The header, as customizers are global", "The header, though only on POSTs", "No header; the builder is bypassed", "An empty header on every request"],
+  "answer": 2, "why": "Customizers are applied when the builder builds a template. A plain new RestTemplate() never meets the builder."},
+ {"q": "Where does CompletableFuture.supplyAsync(fn) run when no executor is passed?",
+  "options": ["On the shared ForkJoinPool common pool", "On the calling listener thread itself", "On Spring's decorated app task executor", "On newly spawned threads per call"],
+  "answer": 0, "why": "The common pool is never decorated, so the tenant is lost. Always pass a context-propagating executor."},
+ {"q": "A @Scheduled job needs per-tenant data. What is the correct pattern?",
+  "options": ["Inherit whatever tenant ran last", "Use a configured default tenant", "Use an InheritableThreadLocal for it", "Loop tenants: set, run, clear"],
+  "answer": 3, "why": "A scheduler tick is a boundary with no tenant. Loop explicitly, one tenant and one transaction at a time."},
+ {"q": "Why doesn't InheritableThreadLocal fix context propagation for executors?",
+  "options": ["It is deprecated since Java 17", "It copies values only at creation", "It cannot hold String values safely", "It leaks memory on every task"],
+  "answer": 1, "why": "Pool threads are created once and reused, so they keep whichever tenant was current when the pool grew."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://docs.micrometer.io/context-propagation/reference/">Micrometer Context Propagation</a> (it's short). Video: search <code>Micrometer context propagation Spring Boot 3</code> (Spring I/O / SpringDeveloper). Watch for <code>ThreadLocalAccessor</code> and Reactor's automatic mode.</p>
+
+<p class="ask">Ask me, for example: "Walk me through each hop in our enricher" or "Should business methods take tenantId as a parameter instead?"</p>
+
+<nav class="pager"><span><a href="0009-dlq-and-broadcast-messages.html">← DLQ and broadcast</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0011-the-trusted-edge-bff.html">Next: The trusted edge →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frozen config and starter switches</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 3 of 13 · Day 1 · ~25 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Frozen config and starter switches</h1>
+<p class="win"><strong>Your win:</strong> spot per-customer settings frozen at startup, and predict exactly which listeners run for any value of <code>multitenancy.enabled</code>.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>State the four rules of tenant context.</li>
+<li>Name the three ways identity gets lost in a flow.</li></ol>
+<details><summary>Check</summary><ol>
+<li>Assign once at the trusted edge. Pass it on, never re-derive it. Hold it in a <code>ThreadLocal</code>, set at the boundary and cleared in <code>finally</code>. Fail closed, with no default tenant. (<a href="0002-tenant-context-four-rules.html">Lesson 2</a>)</li>
+<li>It is not copied, it is taken from an untrusted source, or it is recomputed or defaulted.</li></ol></details>
+</section>
+
+<h2>Settings frozen at startup</h2>
+<p>A singleton holds <em>one</em> value. In a shared JVM, one value cannot be right for every tenant. Ask of every setting: <strong>"Could two tenants want different values?"</strong> If yes, it must become a <a href="../reference/glossary.html#run-time-tenant-config">run-time lookup</a>.</p>
+<table>
+<tr><th><a href="../reference/glossary.html#startup-frozen-config">Frozen pattern</a></th><th>Why it's wrong when shared</th></tr>
+<tr><td><code>@Value("${customer.x}")</code> on a singleton field</td><td>Read once; holds one value</td></tr>
+<tr><td><code>@ConfigurationProperties("customer")</code></td><td>Also bound once at startup</td></tr>
+<tr><td>Constructor or <code>@PostConstruct</code> loading "the customer's" data</td><td>Runs once, with <em>no tenant</em> in context</td></tr>
+<tr><td><code>@Profile("acme")</code> beans</td><td>The bean set is fixed for all tenants</td></tr>
+<tr><td><code>static</code> fields built from config</td><td>JVM-wide, for the JVM's whole lifetime</td></tr>
+</table>
+<pre><code>public record TenantSettings(String baseCurrency, ZoneId zone, int settlementLagDays) {}
+
+public TenantSettings forCurrent() {
+    String t = TenantContext.require();
+    TenantSettings s = byTenant.get(t);
+    if (s == null) throw new UnknownTenantException(t);   // fail closed, no defaults
+    return s;
+}</code></pre>
+
+<h2>Switching old and new behaviour in a starter</h2>
+<pre class="diagram">
+ my-mt-starter.jar
+   META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+       com.example.mt.MultiTenancyAutoConfiguration   (@AutoConfiguration,
+                                                        @ConditionalOnProperty(... havingValue="true"))
+ service:
+   LegacyParseListener  @ConditionalOnProperty(havingValue="false", matchIfMissing=true)  -> default ON
+   ShardParseListener   @ConditionalOnProperty(havingValue="true")                         -> opt-in
+</pre>
+<ul>
+<li><code>havingValue</code> set: matches when the property equals it. Spring Boot compares case-insensitively.</li>
+<li><code>havingValue</code> not set: matches when the property is present and not <code>false</code>.</li>
+<li><code>matchIfMissing</code> (default <code>false</code>) decides the absent case. <code>true</code> on the legacy class is the <a href="../reference/glossary.html#opt-in-flag">opt-in flag</a>'s safe default.</li>
+</ul>
+<p><strong>The trap:</strong> <code>@Conditional</code> annotations only work on component classes and <code>@Bean</code> methods. <code>JmsListenerAnnotationBeanPostProcessor</code> registers every <code>@JmsListener</code> method on an existing bean <em>without</em> evaluating conditions. So a condition on a listener method is silently ignored. Put it on the <strong>class</strong>. <span class="cite"><a href="https://docs.spring.io/spring-boot/reference/features/developing-auto-configuration.html">Spring Boot: Creating your own auto-configuration</a>; <code>@Conditional</code> javadoc.</span></p>
+
+<h2>Practice (12 min)</h2>
+<h3>Code review: find three frozen settings, and one that's fine</h3>
+<pre><code>@Service
+public class SettlementDateCalculator {
+    @Value("${pipeline.batch-size:500}") private int batchSize;
+    @Value("${customer.settlement-lag-days}") private int lagDays;
+    private final HolidayCalendar calendar;
+    private static final ZoneId ZONE = ZoneId.of(System.getProperty("customer.zone", "Europe/London"));
+
+    public SettlementDateCalculator(HolidayCalendarLoader loader) { this.calendar = loader.load(); }
+
+    public LocalDate settle(Instant t) {
+        return calendar.addBusinessDays(t.atZone(ZONE).toLocalDate(), lagDays);
+    }
+}</code></pre>
+<details><summary>Worked answer</summary>
+<ul>
+<li><strong>Fine:</strong> <code>pipeline.batch-size</code> is a platform setting.</li>
+<li><strong>Frozen 1:</strong> <code>lagDays</code>. Replace with <code>settings.forCurrent().settlementLagDays()</code>.</li>
+<li><strong>Frozen 2:</strong> <code>loader.load()</code> in the constructor runs with no tenant. Replace with a provider: <code>calendars.forCurrentTenant()</code>, cached with a <a href="../reference/glossary.html#tenant-scoped-key">tenant-scoped key</a>.</li>
+<li><strong>Frozen 3:</strong> <code>static final ZONE</code>. Replace with <code>settings.forCurrent().zone()</code>.</li>
+</ul></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "multitenancy.enabled is absent. The legacy class has havingValue=false, matchIfMissing=true. What happens?",
+  "options": ["The legacy bean is not created", "The legacy bean is created normally", "Startup fails on the missing property", "The bean is created but stopped"],
+  "answer": 1, "why": "matchIfMissing=true makes the absent case a match, so the legacy path is the default."},
+ {"q": "What does @ConditionalOnProperty do when placed on a @JmsListener method?",
+  "options": ["Disables only that one listener method", "Disables the entire enclosing component class", "Nothing; the listener is always registered", "Fails startup with a configuration error"],
+  "answer": 2, "why": "Conditions are evaluated on component classes and @Bean methods only. The listener post-processor ignores them on other methods."},
+ {"q": "multitenancy.enabled=yes. Legacy uses havingValue=false, matchIfMissing=true; Shard uses havingValue=true. Which run?",
+  "options": ["Only the legacy listener runs here", "Only the shard listener runs here", "Both of the listeners run concurrently", "Neither runs, so nothing is consumed"],
+  "answer": 3, "why": "'yes' equals neither 'false' nor 'true', so both conditions fail and that is an outage. Bind the flag to a typed boolean so 'yes' fails at startup."},
+ {"q": "Which of these is fine to keep as a startup @Value?",
+  "options": ["The customer's settlement lag in days", "The customer's holiday calendar file path", "The pipeline batch size for inserts", "The customer's time zone for dates"],
+  "answer": 2, "why": "Two tenants won't need different batch sizes for this code. The other three are per-customer values."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://docs.spring.io/spring-boot/reference/features/developing-auto-configuration.html">Spring Boot: Creating Your Own Auto-configuration</a>, especially the condition annotations. Video: search <code>Spring Boot custom starter auto-configuration</code> (Spring I/O or SpringDeveloper channels).</p>
+
+<p class="ask">Ask me, for example: "How do I fail startup if neither listener set is active?" or "What else in our services might be frozen?"</p>
+
+<nav class="pager"><span><a href="0002-tenant-context-four-rules.html">← Tenant context</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0004-choosing-a-data-approach.html">Next: Data approach →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

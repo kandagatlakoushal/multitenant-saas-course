@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The DLQ and broadcast messages</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 9 of 13 · Day 3 · ~20 min · <a href="../MISSION.html">Mission</a></p>
+<h1>The DLQ and broadcast messages</h1>
+<p class="win"><strong>Your win:</strong> design dead-letter triage for one misbehaving tenant, and handle a message that belongs to no tenant.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>Why is <code>Math.abs(h) % N</code> wrong?</li><li>What must happen before moving a tenant to another shard?</li></ol>
+<details><summary>Check</summary><ol><li>It is negative for <code>Integer.MIN_VALUE</code>, and it disagrees with <code>floorMod</code> for negative hashes. (<a href="0008-shards-and-one-way-doors.html">Lesson 8</a>)</li><li>Drain the tenant's in-flight messages on the old shard, because order only holds within one queue.</li></ol></details>
+</section>
+
+<h2>The fail-closed path</h2>
+<pre class="diagram">
+ listener throws (unknown tenant / parse error)
+   -> session rollback -> RedeliveryPolicy: retry with delay, up to maximumRedeliveries
+   -> exceeded: "poison ack" -> broker moves message to the DLQ (properties kept, incl. tenantId)
+</pre>
+<ul>
+<li><code>RedeliveryPolicy</code> lives on the connection factory, and can be set per destination with a <code>RedeliveryPolicyMap</code>. Default <code>maximumRedeliveries</code> is 6 and <code>initialRedeliveryDelay</code> is 1000 ms <span class="unverified">⚠ verify for your version</span>.</li>
+<li>The default DLQ is a single shared <code>ActiveMQ.DLQ</code>. <code>individualDeadLetterStrategy</code> with <code>queuePrefix="DLQ."</code> gives one DLQ per destination.</li>
+<li>The broker adds a <code>dlqDeliveryFailureCause</code> property to dead-lettered messages.</li>
+<li>Unknown tenant: retry a <em>few</em> times (that covers a registry reload race after onboarding), then DLQ and alert.</li>
+</ul>
+<p class="cite"><a href="https://activemq.apache.org/components/classic/documentation">ActiveMQ Classic docs: Redelivery Policy; Message Redelivery and DLQ Handling</a>.</p>
+
+<h3>Per-tenant triage</h3>
+<ul>
+<li><strong>Metric:</strong> DLQ depth <em>by tenant</em> (<code>unknown</code> when there's none), alerted per tenant.</li>
+<li><strong>Browse</strong> with a selector: <code>tenantId = 'hooli'</code>.</li>
+<li><strong>Replay tool:</strong> keeps the original <code>tenantId</code> and re-validates it, sends to the tenant's <em>current</em> destination, rate-limited. Messages with no tenant are never replayed blindly.</li>
+</ul>
+
+<h2><a href="../reference/glossary.html#broadcast-message">Broadcast messages</a></h2>
+<pre class="diagram">
+ VirtualTopic.RATES_PUBLISHED (scope=GLOBAL, allow-listed, no tenantId)
+   consumer: for t in registry.active():  set(t); try apply(t) catch record(t) finally clear()
+   or producer: one message PER TENANT with tenantId -> normal path, normal DLQ
+</pre>
+<p>"No tenant" means broadcast <em>only</em> on allow-listed destinations. Everywhere else it still fails closed. Use one transaction per tenant, and one tenant's failure doesn't stop the rest.</p>
+
+<h2>Practice (10 min): the hooli incident</h2>
+<p>At 09:10, hooli starts sending trades with a malformed date. By 09:40, <code>ActiveMQ.DLQ</code> holds 48,000 hooli messages plus about 30 from others (some with no tenant). Hooli fixes their side at 10:15 and asks you to "reprocess everything". Write your plan: detection, containment, separation, replay, and what to change next time.</p>
+<details><summary>Worked answer</summary><ul>
+<li><strong>Detect:</strong> the per-tenant DLQ alert fires, and <code>dlqDeliveryFailureCause</code> confirms one cause.</li>
+<li><strong>Contain:</strong> pause hooli's ingester endpoint, so messages wait on <code>IN.HOOLI</code> in order. Note that each bad message burned 6 redeliveries on a shared shard: a noisy neighbour.</li>
+<li><strong>Separate:</strong> move hooli's messages to <code>DLQ.HOOLI.PARK</code> with a selector. Investigate the no-tenant messages separately: they are a lost-context bug.</li>
+<li><strong>Replay:</strong> the parked messages are still malformed. Prefer hooli re-sending the 09:10–10:15 window. Otherwise, use a reviewed transformation. Keep the original <code>tenantId</code>, use the current destination, rate-limit, and replay before resuming new traffic so older events don't overwrite newer ones.</li>
+<li><strong>Next time:</strong> fewer retries for parse errors (per-destination policy), per-tenant DLQs, and a replay tool that enforces these rules.</li></ul></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "By default, where does ActiveMQ Classic dead-letter messages?",
+  "options": ["One DLQ per destination", "One DLQ per subscriber", "Shared ActiveMQ.DLQ for all", "No DLQ; everything discarded"],
+  "answer": 2, "why": "The shared dead-letter strategy is the default. individualDeadLetterStrategy gives a DLQ per destination."},
+ {"q": "A rates message arrives with no tenantId on an allow-listed GLOBAL destination. Correct handling?",
+  "options": ["Apply once, with no tenant set", "Send it to the dead-letter queue", "Apply it under the fallback tenant", "For each tenant: set, apply, clear"],
+  "answer": 3, "why": "Broadcast work is fanned out per tenant, with context set and cleared for each tenant and one transaction per tenant."},
+ {"q": "Replaying a hooli message from the DLQ: which tenantId does the replay tool use?",
+  "options": ["The original tenantId, after a recheck", "The operator types it in manually", "Whichever tenant owns the target shard", "None; replays run without any tenant"],
+  "answer": 0, "why": "Identity is never re-assigned after the edge. Keep the original and re-check it against the registry."},
+ {"q": "Why pause hooli's ingestion rather than let bad messages keep flowing to the DLQ?",
+  "options": ["The DLQ would overflow from that", "Their source queue keeps their order", "Pausing deletes the bad ones safely", "ActiveMQ needs a pause before replays"],
+  "answer": 1, "why": "Messages waiting on IN.HOOLI keep their order and cost the shared shard nothing. Dead-lettered messages lose their place."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read ActiveMQ Classic's <em>Message Redelivery and DLQ Handling</em> page (<a href="https://activemq.apache.org/components/classic/documentation">documentation index</a>), focusing on the dead-letter strategies and their options.</p>
+
+<p class="ask">Ask me, for example: "Draft the replay tool's interface" or "How many retries for unknown-tenant errors?"</p>
+
+<nav class="pager"><span><a href="0008-shards-and-one-way-doors.html">← Shards</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0010-thread-hops.html">Next: Thread hops →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

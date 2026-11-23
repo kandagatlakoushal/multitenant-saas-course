@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Silo, pool, bridge: decided per layer</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 1 of 13 · Day 1 · ~20 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Silo, pool, bridge: decided per layer</h1>
+<p class="win"><strong>Your win:</strong> describe any tenant's placement as three answers (compute, queues, database), name the overall model, and name the risk it accepts.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<p>From your own platform, before reading on. Write the answers down.</p>
+<ol>
+<li>How does one of your services "know" which customer it serves today? Name two places that knowledge lives.</li>
+<li>What happens to a <code>ThreadLocal</code> set on a pooled thread that is never removed?</li>
+</ol>
+<details><summary>Check</summary>
+<ol>
+<li>Usually the active Spring profile, a customer-specific <code>application-&lt;customer&gt;.yml</code>, the JDBC URL of that customer's database, queue names in config, or deployment environment variables. In a shared deployment, every one of these becomes a per-tenant lookup.</li>
+<li>The next task on that thread sees the old value. In this course, that means it runs as the previous tenant: a cross-tenant leak.</li>
+</ol></details>
+</section>
+
+<h2>Why providers share at all</h2>
+<pre class="diagram">
+ PER-CUSTOMER (today)                     SHARED (target)
+ Customer A: [50 svcs][queues][DBs]       +----------------------------+
+ Customer B: [50 svcs][queues][DBs]  ==>  | 50 svcs, one deployment    |
+ ...                                      | shard queues + some silos  |
+ Customer K: [50 svcs][queues][DBs]       | shared DB(s), schema/tenant|
+                                          +----------------------------+
+ cost ~ K stacks · onboarding = a stack    cost ~ 1 stack · onboarding = registry entry
+ release = K rollouts                      release = 1 rollout, 1 version
+</pre>
+<p>Sharing buys lower cost, onboarding in minutes, and one release. In return the provider accepts a bigger <a href="../reference/glossary.html#blast-radius">blast radius</a>, the risk of cross-tenant leaks, and <a href="../reference/glossary.html#noisy-neighbour">noisy neighbours</a>. <span class="cite">Sources: <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-architecture-fundamentals/saas-architecture-fundamentals.html">AWS SaaS Architecture Fundamentals</a>; <a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/overview">Azure multitenant guide</a>.</span></p>
+<p class="meeting">Meeting line: "Sharing trades isolation by construction for isolation by enforcement. Our job is to make the enforcement impossible to forget."</p>
+
+<h2>Three models, chosen per layer</h2>
+<table>
+<tr><th>Model</th><th>Meaning</th><th>In our pipeline</th></tr>
+<tr><td><a href="../reference/glossary.html#silo">Silo</a></td><td>Dedicated to one tenant</td><td><code>globex</code> has its own database and its own <code>PARSE.globex</code> queue</td></tr>
+<tr><td><a href="../reference/glossary.html#pool">Pool</a></td><td>Shared by many tenants</td><td><code>acme</code> and 40 others share <code>PARSE.shard-0..3</code> and the parser pods</td></tr>
+<tr><td><a href="../reference/glossary.html#bridge">Bridge</a></td><td>A mix across layers</td><td>Pooled compute and queues, but a siloed schema per tenant</td></tr>
+</table>
+<pre class="diagram">
+            compute     queues               database
+ acme       POOL        POOL (shard-2)       schema on pooled server   -> bridge
+ globex     POOL        SILO (dedicated)     SILO: own DB              -> bridge, top tier
+ hooli      POOL        POOL (shard-1)       POOL: shared tables       -> pool
+ initech    SILO        SILO                 SILO                      -> legacy silo
+</pre>
+<p><strong>Two key points.</strong> The model is chosen <em>per layer</em>, so "are we silo or pool?" is the wrong question. And it can differ <em>per tenant</em>: that is <a href="../reference/glossary.html#tiering">tiering</a>, and it is why the <a href="../reference/glossary.html#tenant-registry">tenant registry</a> holds a placement for each tenant. <span class="cite">AWS Fundamentals; Azure <a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/considerations/tenancy-models">Tenancy models</a> (which says "vertically/horizontally partitioned" for the same ideas).</span></p>
+<p><strong>Isolation is not the same as silo.</strong> <a href="../reference/glossary.html#isolation">Isolation</a> must be enforced and tested in every model. A silo still leaks if code connects to the wrong database. A pool can be well isolated with row-level security. <span class="cite"><a href="https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html">AWS Tenant Isolation Strategies</a>.</span></p>
+
+<h2>Control plane vs application plane</h2>
+<p>The <a href="../reference/glossary.html#control-plane">control plane</a> manages tenants: the registry, onboarding, offboarding and per-tenant config. The <a href="../reference/glossary.html#application-plane">application plane</a> (ingester, parser, enricher, rules, reporter) does the tenant's work. It reads the registry and never decides who the tenants are. Validate the registry at load time: a duplicate <code>id</code> or <code>sourceQueue</code> is a leak waiting to happen.</p>
+
+<h2>Practice (8 min)</h2>
+<p>Answer each one before looking at the feedback.</p>
+<script type="application/json" class="quiz-data">
+[
+ {"q": "acme runs on shared pods, uses a shared shard queue, and has its own schema in a shared database. What is its overall model?",
+  "options": ["Pool, because its compute is shared", "Silo, because its schema is dedicated", "Bridge, mixing silo and pool layers", "Single-tenant, because its data is separate"],
+  "answer": 2, "why": "Pooled compute and queues with a dedicated schema is a mix across layers: bridge. Answer per layer first, then name the mix."},
+ {"q": "Which of these belongs to the control plane?",
+  "options": ["The parser splitting incoming trades", "The onboarding flow creating schemas", "The enricher calling reference data", "The reporter writing daily summaries"],
+  "answer": 1, "why": "Onboarding manages tenants. The other three do tenant work, so they are the application plane."},
+ {"q": "hooli's rows live in shared tables, protected by row-level security, with leak tests in CI. Is hooli isolated?",
+  "options": ["No, only silos are ever isolated", "No, pooled data can never isolate", "Yes, if enforced and then tested", "Yes, because RLS is always enabled"],
+  "answer": 2, "why": "Isolation is a property you enforce and test, in any model. RLS is not on by default: you enable (and force) it."},
+ {"q": "globex has shared pods, a dedicated queue and its own database server. Which risk still remains?",
+  "options": ["A poison message crashing shared pods", "Another tenant reading its database rows", "Its queue filling with others' messages", "Its migrations running on others' schemas"],
+  "answer": 0, "why": "Compute is still pooled. A crash, memory leak or poison message in a parser pod hurts every tenant on it, globex included."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-architecture-fundamentals/saas-architecture-fundamentals.html">AWS: SaaS Architecture Fundamentals</a>, the sections on control plane vs application plane and silo/pool/bridge (about 20 minutes). Optional video: search YouTube for <code>Tod Golding re:Invent SaaS architecture</code> (AWS Events channel). Watch for how he describes tiering and the tenant context flowing end to end.</p>
+
+<p class="ask">Anything unclear? Ask me, your agent, a follow-up. For example: "Is schema-per-tenant silo or pool in a meeting?" or "How would you describe our initech tenant?"</p>
+
+<nav class="pager"><span><a href="../index.html">Course index</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0002-tenant-context-four-rules.html">Next: Tenant context →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Choosing a data approach</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 4 of 13 · Day 2 · ~20 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Choosing a data approach</h1>
+<p class="win"><strong>Your win:</strong> pick database per tenant, schema per tenant, or shared tables with row-level security (RLS) for a tenant profile, and defend it on three dimensions.</p>
+
+<section class="recall">
+<h2>Recall first (3 min): Day 1, spaced</h2>
+<ol><li>Why is "schema per tenant on a shared server" not a pure silo?</li>
+<li>Where does <code>@ConditionalOnProperty</code> work, and where is it ignored?</li>
+<li>Why must there be no default tenant?</li></ol>
+<details><summary>Check</summary><ol>
+<li>The schema is dedicated, but the server's CPU, I/O, write-ahead log (WAL) and connection limit are shared.</li>
+<li>It works on component classes and <code>@Bean</code> methods. It is ignored on other methods, such as <code>@JmsListener</code> methods.</li>
+<li>A default turns a visible "missing tenant" bug into silent cross-tenant data.</li></ol></details>
+</section>
+
+<h2>The three approaches</h2>
+<pre class="diagram">
+ DATABASE PER TENANT        SCHEMA PER TENANT               SHARED TABLES (+RLS)
+ [db_globex] [db_stark]     db pg-shared-1                  db pg-pool-1
+  own pool each              t_acme.trades                   trades: tenant_id | trade_id
+                             t_hooli.trades ...                      acme      | 10001
+                             one pool, search_path/borrow            hooli     | 10001
+   SILO                      schema silo on POOLED server     POOL (policy filters rows)
+</pre>
+<table>
+<tr><th></th><th>Database per tenant</th><th>Schema per tenant</th><th>Shared tables + RLS</th></tr>
+<tr><td>Isolation</td><td>Strongest</td><td>Good (wrong <code>search_path</code> leaks)</td><td>Weakest by default; RLS raises it</td></tr>
+<tr><td>Cost per tenant</td><td>High</td><td>Low to medium</td><td>Lowest</td></tr>
+<tr><td>Migrations</td><td>N databases</td><td>N schemas</td><td>One (big table)</td></tr>
+<tr><td>Connections</td><td>A pool per DB × pods</td><td>One pool per server</td><td>One pool</td></tr>
+<tr><td>Restore one tenant</td><td>Easy</td><td><code>pg_dump -n t_acme</code></td><td>Hard (filtered export)</td></tr>
+<tr><td>Noisy neighbour</td><td>Isolated if separate server</td><td>Shared server</td><td>Shared everything</td></tr>
+</table>
+<p class="cite">Sources: <a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/approaches/storage-data">Azure: Storage and data approaches</a>; <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html">AWS Tenant Isolation Strategies</a>; Golding on data partitioning.</p>
+
+<h2>RLS: isolation enforced by the database</h2>
+<pre><code>ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trades FORCE ROW LEVEL SECURITY;          -- apply to the table owner too
+CREATE POLICY tenant_isolation ON trades
+  USING      (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));</code></pre>
+<ul>
+<li>Superusers and <code>BYPASSRLS</code> roles always bypass it. The <strong>table owner</strong> bypasses it too, unless you use <code>FORCE</code>. Never connect the app as the owner.</li>
+<li><code>current_setting(..., true)</code> returns NULL when the setting is missing. <code>tenant_id = NULL</code> is never true, so no rows are returned: fail closed.</li>
+</ul>
+<p class="cite"><a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL: Row Security Policies</a>.</p>
+<p class="meeting">Meeting line: "Shared tables without RLS put isolation in every query. Schema per tenant puts it in one place, the borrow. RLS puts it in the database."</p>
+
+<h2>Practice (10 min)</h2>
+<h3>Choose and justify (write three reasons for each, then check)</h3>
+<ol>
+<li><strong>Globex:</strong> 40% of volume; the contract requires a point-in-time restore of their data within 4 hours; auditors want separate storage.</li>
+<li><strong>The long tail:</strong> 280 small tenants, self-service sign-up next year, low price point.</li>
+<li><strong>Regional banks:</strong> 25 steady tenants who want exports on demand and occasional one-tenant data corrections.</li>
+</ol>
+<details><summary>Worked answer</summary><ol>
+<li><strong>Database per tenant on its own server.</strong> Point-in-time restore of one server is standard. Separate storage satisfies the auditors. 40% of volume would dominate a shared server. Watch: an extra pool in every service, and a separate line in the migration report.</li>
+<li><strong>Shared tables + RLS</strong> (or schema per tenant, if switching is already built). Onboarding is a row, not DDL. One migration. Lowest cost. Restore is hard: say so in the contract.</li>
+<li><strong>Schema per tenant.</strong> <code>pg_dump -n</code> for exports. Corrections stay inside one schema. One server, one pool, 25 migrations.</li></ol></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "The app connects as the table owner; RLS is enabled but not forced. What do queries see?",
+  "options": ["Only rows matching the tenant policy", "No rows until policies get attached", "All rows; owners bypass the policies", "An error, because owners cannot query"],
+  "answer": 2, "why": "Table owners bypass RLS unless FORCE ROW LEVEL SECURITY is set. Use a separate, non-owner app role."},
+ {"q": "app.tenant_id was never set on this connection. The policy is tenant_id = current_setting('app.tenant_id', true). A SELECT returns:",
+  "options": ["All rows; the policy gets skipped", "No rows; comparison with null fails", "The previous tenant's rows are returned", "An error: the setting is missing"],
+  "answer": 1, "why": "With missing_ok=true the function returns NULL, and the comparison is never true. That is the fail-closed outcome."},
+ {"q": "The contract says: restore one tenant to any point in the last 7 days within 4 hours. Best fit?",
+  "options": ["Shared tables guarded by RLS policies", "One schema each on shared server", "Own database on a dedicated server", "Shared tables with a tenant_id column"],
+  "answer": 2, "why": "Point-in-time recovery works per server. With shared storage you would restore everyone, then extract one tenant."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/approaches/storage-data">Azure: Architectural approaches for storage and data in multitenant solutions</a>, then <a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL: Row Security Policies</a>. Video: search <code>PostgreSQL row level security multi tenant</code>. Watch for the owner-bypass and <code>FORCE</code> details.</p>
+
+<p class="ask">Ask me, for example: "Can we mix approaches per tenant?" or "What does moving a tenant from schema to its own database involve?"</p>
+
+<nav class="pager"><span><a href="0003-frozen-config-and-starter-switches.html">← Frozen config</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0005-search-path-traps.html">Next: search_path traps →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

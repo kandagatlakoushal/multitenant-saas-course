@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caches, locks and maps are data too</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 7 of 13 · Day 2 · ~20 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Caches, locks and maps are data too</h1>
+<p class="win"><strong>Your win:</strong> review in-memory state and find every key that is missing the tenant.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>What does <code>connectionInitSql</code> get wrong for multi-tenancy?</li><li>What is wrong with a <code>@Transactional</code> method that loops over tenants?</li></ol>
+<details><summary>Check</summary><ol><li>It runs once per physical connection, not per borrow. (<a href="0006-switch-on-every-borrow.html">Lesson 6</a>)</li><li>One transaction borrows one connection with one path, so every write goes to the first tenant. (<a href="0005-search-path-traps.html">Lesson 5</a>)</li></ol></details>
+</section>
+
+<h2>The rule</h2>
+<p>Any in-memory structure that holds tenant data is a shared table with no <code>WHERE</code> clause, unless its key includes the tenant: a <a href="../reference/glossary.html#tenant-scoped-key">tenant-scoped key</a>.</p>
+<pre class="diagram">
+ key (table, version)                  key (tenant, table, version)
+ ("instruments", 42) -> acme's rows     ("acme",  "instruments", 42) -> acme's rows
+ hooli asks ("instruments", 42)         ("hooli", "instruments", 42) -> hooli's rows
+   -> gets ACME's rows   LEAK
+</pre>
+<p><strong>A real-world style leak:</strong> versions are counters per tenant, so <code>acme</code> and <code>hooli</code> both reach version 42. Whoever loads first fills the cache for both. There is no error, just wrong reference data driving rules and reports, and only when two version numbers collide.</p>
+<p><strong>Spring <code>@Cacheable</code>:</strong> the default key is built from the method parameters only, and the tenant isn't a parameter. <span class="cite"><a href="https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html">Spring: Cache annotations, default key generation</a>.</span></p>
+<pre><code>@Bean
+KeyGenerator tenantKeyGenerator() {
+    return (target, method, params) -&gt;
+        new TenantKey(TenantContext.require(), method.getName(), List.of(params));
+}
+// @Cacheable(cacheNames = "refdata", keyGenerator = "tenantKeyGenerator")</code></pre>
+<h3>Key everything by tenant</h3>
+<ul>
+<li>Caches (Caffeine, <code>@Cacheable</code>, Redis prefixes).</li>
+<li>Static and singleton maps, memoised lookups.</li>
+<li>Locks (ShedLock names, <code>synchronized</code> on interned strings).</li>
+<li>Rate-limit counters, and idempotency or de-duplication stores (<code>tradeId</code> repeats across tenants).</li>
+<li>Eviction must be possible per tenant, for offboarding and data corrections.</li>
+</ul>
+
+<h2>Practice (12 min): review three snippets</h2>
+<pre><code>// A
+record RefKey(String table, long version) {}
+List&lt;Row&gt; rows(String table, long v) { return cache.get(new RefKey(table, v), k -&gt; repo.load(k.table(), k.version())); }
+
+// B
+@Transactional public void rollupAll(List&lt;String&gt; ids) {
+    for (String t : ids) { TenantContext.set(t); try { summaryRepo.save(...); } finally { TenantContext.clear(); } }
+}
+
+// C
+private static final Map&lt;String, String&gt; LEI_BY_CODE = new ConcurrentHashMap&lt;&gt;();
+String lei(String code) { return LEI_BY_CODE.computeIfAbsent(code, c -&gt; jdbc.queryForObject("select lei ...", String.class, c)); }</code></pre>
+<details><summary>Worked answer</summary><ul>
+<li><strong>A:</strong> the key lacks the tenant. Fix: <code>RefKey(tenantId, table, version)</code> using <code>require()</code>. Size the cache for tenants × entries, or one tenant evicts everyone else's.</li>
+<li><strong>B:</strong> one transaction, one connection, one path, so every summary is written to the caller's tenant, or the whole thing fails closed if none is set. Fix: no transaction on the loop, a <code>@Transactional</code> per-tenant method on another bean, and one tenant's failure doesn't stop the others.</li>
+<li><strong>C:</strong> counterparty codes are per tenant, and the first tenant's answer serves everyone for the life of the JVM. Fix: key by <code>(tenantId, code)</code>, a bounded instance cache, not a static.</li></ul></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "@Cacheable on a method taking (table, version), with the default key generator. The key contains:",
+  "options": ["The tenant, the table, the version", "Only the table and the version", "The bean name and the parameters", "A random value chosen per tenant"],
+  "answer": 1, "why": "The default key is built from method parameters only. Add the tenant with a custom KeyGenerator or a SpEL key."},
+ {"q": "A static Map from counterparty code to LEI in a shared service. What is the problem?",
+  "options": ["Static maps are not thread-safe here", "Maps cannot hold LEI string values", "Statics reset on every listener call", "The first tenant's answer serves all"],
+  "answer": 3, "why": "Codes repeat across tenants with different meanings, and the static map keeps whichever tenant asked first."},
+ {"q": "Which of these needs the tenant in its key?",
+  "options": ["Caches, locks, counters and dedup stores", "Only caches holding reference data rows", "Only distributed locks shared across pods", "Nothing, if schemas are per tenant"],
+  "answer": 0, "why": "Schema-per-tenant isolates the database, not your JVM's memory. All shared in-memory state needs the tenant."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://docs.spring.io/spring-framework/reference/integration/cache/annotations.html">Spring Framework: Declarative annotation-based caching</a>, the default key generation and custom key generation sections.</p>
+
+<p class="ask">Ask me, for example: "Should we use one cache per tenant or one cache with tenant keys?" or "How would this look with Redis?"</p>
+
+<nav class="pager"><span><a href="0006-switch-on-every-borrow.html">← Switch on every borrow</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0008-shards-and-one-way-doors.html">Next: Shards →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>search_path traps</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 5 of 13 · Day 2 · ~20 min · <a href="../MISSION.html">Mission</a></p>
+<h1><code>search_path</code> traps</h1>
+<p class="win"><strong>Your win:</strong> given a connection's session state, predict exactly which table an unqualified query reads, or whether it errors.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>Which roles bypass RLS?</li><li>Rank the three data approaches by per-tenant restore effort.</li></ol>
+<details><summary>Check</summary><ol><li>Superusers, <code>BYPASSRLS</code> roles, and the table owner unless <code>FORCE</code> is set. (<a href="0004-choosing-a-data-approach.html">Lesson 4</a>)</li><li>Database per tenant (easiest), then schema per tenant, then shared tables (hardest).</li></ol></details>
+</section>
+
+<h2>How lookup works</h2>
+<pre class="diagram">
+ search_path = t_acme              SELECT * FROM trades
+                                          |
+ [pg_temp] -> [pg_catalog] -> [t_acme] -> (nothing else)
+  temp tables   system          found
+  searched FIRST for tables,
+  unless listed explicitly
+</pre>
+<ul>
+<li>The first schema in the path containing the name wins. Default path: <code>"$user", public</code>.</li>
+<li><code>pg_catalog</code> is implicitly first. <code>pg_temp</code> is implicitly first <em>for tables</em> (never for functions).</li>
+<li><strong>Schemas that don't exist are skipped silently.</strong></li>
+<li>The <a href="../reference/glossary.html#current-schema">current schema</a> is the first <em>existing</em> one. If none exist, <code>CREATE</code> fails.</li>
+</ul>
+<p class="cite"><a href="https://www.postgresql.org/docs/current/ddl-schemas.html">PostgreSQL: Schemas</a>; <a href="https://www.postgresql.org/docs/current/runtime-config-client.html">Client Connection Defaults</a>.</p>
+
+<h2>Four traps</h2>
+<h3>1. A missing tenant schema falls through to <code>public</code></h3>
+<p>With <code>search_path = t_newco, public</code> and <code>t_newco</code> not created yet, every query reads <code>public.trades</code>. Rules: set <em>only</em> the tenant schema; keep <code>public</code> empty with no <code>CREATE</code> for the app role (PostgreSQL 15 stopped granting it by default); check that the schema exists against the registry.</p>
+<h3>2. <code>SET</code> vs <code>SET LOCAL</code></h3>
+<table>
+<tr><th>Command</th><th>Lasts until</th><th>Outside a transaction</th></tr>
+<tr><td><code>SET search_path TO t_acme</code></td><td>End of session, so it <em>survives the pool</em>. Reverted if its transaction rolls back.</td><td>Applies</td></tr>
+<tr><td><code>SET LOCAL ...</code></td><td>End of transaction</td><td><strong>No effect</strong> (warning only)</td></tr>
+<tr><td><code>set_config('search_path', ?, false)</code></td><td>Like <code>SET</code>, but takes a bind parameter</td><td>Applies</td></tr>
+</table>
+<p class="cite"><a href="https://www.postgresql.org/docs/current/sql-set.html">PostgreSQL: SET</a>.</p>
+<h3>3. Temp tables live per connection</h3>
+<p>Tenant A's <code>CREATE TEMP TABLE</code> is still there when tenant B borrows the connection, and <code>pg_temp</code> is searched first. Use <code>ON COMMIT DROP</code>, or avoid temp tables in shared services.</p>
+<h3>4. One transaction means one connection, so one path</h3>
+<pre><code>@Transactional
+void nightly() {                       // borrow -&gt; SET search_path TO t_acme
+  for (t : tenants) { TenantContext.set(t); repo.save(summary(t)); }   // all into t_acme
+}</code></pre>
+<p>Rule: one tenant per transaction. Loop <em>outside</em> the transactional method, and call a <code>@Transactional</code> method on another bean (self-invocation bypasses the proxy).</p>
+
+<h2>Practice (8 min)</h2>
+<p>Each question gives a connection's state. What does <code>SELECT count(*) FROM trades</code> read?</p>
+<script type="application/json" class="quiz-data">
+[
+ {"q": "search_path = t_newco, public. t_newco does not exist. public.trades exists.",
+  "options": ["Fails because t_newco doesn't exist", "Returns zero rows for t_newco", "Reads from the public.trades table", "Creates t_newco, then reads it"],
+  "answer": 2, "why": "Missing schemas are skipped silently, so the query falls through to public. This is the onboarding leak."},
+ {"q": "search_path = t_acme. Earlier on this pooled connection, tenant hooli ran CREATE TEMP TABLE trades AS SELECT ...",
+  "options": ["Reads hooli's temporary trades table", "Reads the t_acme.trades table instead", "Fails with an ambiguity error", "Reads both tables, then unions"],
+  "answer": 0, "why": "pg_temp is searched first for tables, and the temp table survived on the connection. A cross-tenant leak."},
+ {"q": "Autocommit is on. The code ran SET LOCAL search_path TO t_acme, then the query. The previous path was t_hooli.",
+  "options": ["Reads t_acme.trades exactly as was intended", "Errors because no transaction is open", "Reads public.trades as the fallback schema", "Reads t_hooli.trades; SET LOCAL did nothing"],
+  "answer": 3, "why": "SET LOCAL outside a transaction has no effect (warning only), so the stale path stays."},
+ {"q": "search_path = t_newco only. t_newco does not exist, and public is not in the path.",
+  "options": ["Falls back to the public.trades table", "Errors: relation trades does not exist", "Returns zero rows from empty schema", "Creates t_newco before reading from it"],
+  "answer": 1, "why": "Nothing on the path has a trades table, so it errors. That is the fail-closed outcome you want."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://www.postgresql.org/docs/current/ddl-schemas.html">PostgreSQL: Schemas</a> (the search path section) and the <code>search_path</code> entry in <a href="https://www.postgresql.org/docs/current/runtime-config-client.html">Client Connection Defaults</a>. They are short and precise.</p>
+
+<p class="ask">Ask me, for example: "Do cached prepared statements see a new search_path?" (Since PostgreSQL 9.3 they are re-parsed when it changes; we'll test it anyway.)</p>
+
+<nav class="pager"><span><a href="0004-choosing-a-data-approach.html">← Data approach</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0006-switch-on-every-borrow.html">Next: Switch on every borrow →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

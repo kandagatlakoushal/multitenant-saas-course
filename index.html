@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-tenant SaaS lessons</title>
+<link rel="stylesheet" href="assets/course.css"></head>
+<body><main>
+<p class="kicker">Teaching workspace · <a href="MISSION.html">Mission</a> · <a href="RESOURCES.html">Resources</a> · <a href="NOTES.html">Notes</a></p>
+<h1>Multi-tenant SaaS for Spring Boot microservices</h1>
+<p class="win">Convert per-customer services to one shared deployment safely, review code for cross-tenant leaks, and argue the trade-offs. Running example: the trade-processing pipeline (ingester → parser → enricher → rules → reporter, plus the UI gateway).</p>
+<p>Take one lesson at a time, in order. Start each day by redoing the previous day's quizzes cold, using the Reset button. That is your spaced retrieval practice.</p>
+
+<h2>Day 1: Foundations and tenant identity</h2>
+<ul class="lessons">
+<li><a href="lessons/0001-silo-pool-bridge-per-layer.html">1. Silo, pool, bridge: decided per layer</a></li>
+<li><a href="lessons/0002-tenant-context-four-rules.html">2. Tenant context: the four rules</a></li>
+<li><a href="lessons/0003-frozen-config-and-starter-switches.html">3. Frozen config and starter switches</a></li>
+</ul>
+<h2>Day 2: Data isolation</h2>
+<ul class="lessons">
+<li><a href="lessons/0004-choosing-a-data-approach.html">4. Choosing a data approach</a></li>
+<li><a href="lessons/0005-search-path-traps.html">5. search_path traps</a></li>
+<li><a href="lessons/0006-switch-on-every-borrow.html">6. Switch on every borrow</a></li>
+<li><a href="lessons/0007-caches-locks-and-maps.html">7. Caches, locks and maps are data too</a></li>
+</ul>
+<h2>Day 3: Messaging and context propagation</h2>
+<ul class="lessons">
+<li><a href="lessons/0008-shards-and-one-way-doors.html">8. Shards and one-way doors</a> (with shard calculator)</li>
+<li><a href="lessons/0009-dlq-and-broadcast-messages.html">9. The DLQ and broadcast messages</a></li>
+<li><a href="lessons/0010-thread-hops.html">10. Thread hops and outbound calls</a></li>
+</ul>
+<h2>Day 4: The edge, operations, testing</h2>
+<ul class="lessons">
+<li><a href="lessons/0011-the-trusted-edge-bff.html">11. The trusted edge: the UI gateway</a></li>
+<li><a href="lessons/0012-noisy-neighbours-observability-lifecycle.html">12. Noisy neighbours, observability, lifecycle</a></li>
+<li><a href="lessons/0013-capstone-testing-isolation.html">13. Capstone: testing isolation</a></li>
+</ul>
+<h2>Reference</h2>
+<ul class="lessons">
+<li><a href="reference/glossary.html">Glossary</a>: one set of terms, used in every lesson</li>
+<li><a href="reference/cheat-sheet.html">Cheat sheet</a>: the compressed essence of all lessons, printable</li>
+</ul>
+<h2>Long-form version</h2>
+<ul class="lessons">
+<li><a href="course/">The 4-day course as written notes</a>: the same material in long form, with warm-ups, exercises, quizzes and worked answers for each day</li>
+</ul>
+<p class="ask">Your agent is your teacher. Ask follow-up questions any time, or ask for the next lesson to be adjusted to what you found hard.</p>
+</main></body></html>

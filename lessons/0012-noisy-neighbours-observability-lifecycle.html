@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Noisy neighbours, observability, lifecycle</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 12 of 13 · Day 4 · ~25 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Noisy neighbours, observability, lifecycle</h1>
+<p class="win"><strong>Your win:</strong> pick the cheapest control for a noisy tenant, tag metrics without a cardinality explosion, and put onboarding and offboarding steps in a safe order.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>Where does the BFF filter go in the security chain, and what must it not be?</li><li>What makes a hot shard, and what is the structural fix?</li></ol>
+<details><summary>Check</summary><ol><li>After authentication. It must not be a <code>@Component</code>, or it is double-registered. (<a href="0011-the-trusted-edge-bff.html">Lesson 11</a>)</li><li>Big tenants hashing to the same shard. The fix is to promote one to a dedicated queue. (<a href="0008-shards-and-one-way-doors.html">Lesson 8</a>)</li></ol></details>
+</section>
+
+<h2><a href="../reference/glossary.html#noisy-neighbour">Noisy neighbours</a></h2>
+<pre class="diagram">
+ IN.ACME   -┐
+ IN.HOOLI  -┼-> [ingester: listener per tenant, rate limit per tenant] -> shards -> parsers
+ IN.GLOBEX -┘        slowing ONE listener only grows THAT tenant's own queue
+</pre>
+<table>
+<tr><th>Control</th><th>Where</th></tr>
+<tr><td><a href="../reference/glossary.html#quota">Quota</a></td><td>Control plane: messages per day, per tier. Enforced at the ingester.</td></tr>
+<tr><td><a href="../reference/glossary.html#rate-limit">Rate limit</a></td><td>A token bucket per tenant on the ingester listener and the BFF. Source queues give free back-pressure.</td></tr>
+<tr><td><a href="../reference/glossary.html#bulkhead">Bulkhead</a></td><td>Listener containers per shard or dedicated tenant, executors per tier.</td></tr>
+<tr><td><a href="../reference/glossary.html#load-shedding">Load shedding</a></td><td>Reject early and cheaply (429/503), lowest tier first. Retries must back off.</td></tr>
+<tr><td>Tiering</td><td>The structural fix: dedicated queue, own database.</td></tr>
+</table>
+<p class="cite"><a href="https://sre.google/sre-book/handling-overload/">Google SRE: Handling Overload</a>; <a href="https://learn.microsoft.com/azure/architecture/antipatterns/noisy-neighbor/noisy-neighbor">Azure: Noisy Neighbor antipattern</a>.</p>
+
+<h2>Observability per tenant</h2>
+<ul>
+<li>Put <code>tenantId</code> in the <a href="../reference/glossary.html#mdc">MDC</a> where you set <code>TenantContext</code>, and remove it in the same <code>finally</code>. MDC is a <code>ThreadLocal</code> too.</li>
+<li>Cardinality: <code>series = metrics × tenants × other tags × buckets</code>. 40 timers × 300 tenants × 5 stages × 30 buckets is about 1.8 million series. 6 key metrics × 300 × 5 is 9,000.</li>
+<li>Put the <code>tenant</code> tag on a few key metrics only (messages, errors, DLQ depth, lag), and enforce that with one <code>MeterFilter</code> allow-list.</li>
+<li><strong>Per-tenant alerts</strong> on error ratio, DLQ depth and lag. A global average hides one small tenant's total outage.</li>
+</ul>
+
+<h2>Lifecycle</h2>
+<pre class="diagram">
+ ONBOARD:  registry PROVISIONING -> schema + full migration -> queues/authz -> config/users
+           -> ACTIVE -> smoke test with a synthetic message
+ OFFBOARD: SUSPEND (ingestion + login) -> drain -> export -> retention -> delete everything
+           (schema/DB, caches, queues, DLQ, per-retention logs) -> tombstone; NEVER reuse the ID
+</pre>
+<p>Making a tenant <code>ACTIVE</code> before its schema exists recreates the "missing schema falls back to <code>public</code>" leak. Backups hold the data until they expire: document it. <span class="cite"><a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/considerations/tenant-lifecycle">Azure: Tenant lifecycle</a>.</span></p>
+
+<h2>Practice (8 min)</h2>
+<script type="application/json" class="quiz-data">
+[
+ {"q": "Which metric tagging approach suits 300 tenants?",
+  "options": ["Tag every timer by the tenant", "Tag only key metrics by tenant", "Never tag any metric by tenant", "Tag only the histograms by tenant"],
+  "answer": 1, "why": "A handful of key metrics with a tenant tag keeps the series count bounded. Use logs and traces for depth."},
+ {"q": "What is the first step of offboarding?",
+  "options": ["Suspend its ingestion and its logins", "Drop the tenant's schemas and queues", "Reassign its tenant ID to newcomers", "Delete its entry from the registry"],
+  "answer": 0, "why": "Stop new work first. Deletion comes last, and IDs are tombstoned, never reused."},
+ {"q": "hooli bursts to 10x its normal rate on IN.HOOLI. What is the cheapest effective control?",
+  "options": ["Increase the shard count right away", "Add more parser pods for everyone", "Drop hooli's messages from the queue", "Throttle the listener for hooli only"],
+  "answer": 3, "why": "Throttling one tenant's listener builds the backlog on that tenant's own queue, and nobody else is affected."},
+ {"q": "Why alert per tenant rather than on global averages?",
+  "options": ["Global alerts are costlier to evaluate", "Prometheus requires tenant tags on alerts", "Averages hide one tenant's total outage", "They reduce the overall metric cardinality"],
+  "answer": 2, "why": "One small tenant at 100% errors barely moves a 300-tenant average."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://sre.google/sre-book/handling-overload/">Google SRE: Handling Overload</a>. It is the clearest argument for per-customer limits and early rejection. Video: search <code>metrics cardinality explosion Prometheus</code>.</p>
+
+<p class="ask">Ask me, for example: "Draft our onboarding job as idempotent steps" or "Which five metrics should carry the tenant tag?"</p>
+
+<nav class="pager"><span><a href="0011-the-trusted-edge-bff.html">← The trusted edge</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0013-capstone-testing-isolation.html">Next: Capstone →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary</title><link rel="stylesheet" href="../assets/course.css"></head><body><main>
+<p class="kicker">Reference · <a href="../index.html">Course index</a> · <a href="glossary.html">Glossary</a> · <a href="cheat-sheet.html">Cheat sheet</a></p>
+<h1>Glossary</h1>
+
+<p>One glossary for every lesson. Lessons use these terms with exactly these meanings. Short source tags such as <span class='cite'>[AWS-Fund]</span> refer to <a href='../RESOURCES.md'>RESOURCES.md</a>.</p>
+<h2>Day 1: Foundations and tenant identity</h2>
+<table><tr><th>Term</th><th>Meaning</th></tr>
+<tr id='tenant'><td><strong>Tenant</strong></td><td>A customer organisation whose users and data the system serves, and which must be kept apart from other customers. One tenant has many users. <span class='cite'>[AWS-Fund]</span></td></tr>
+<tr id='tenant-id-tenantid'><td><strong>Tenant ID</strong> (<code>tenantId</code>)</td><td>The short, stable, non-secret identifier of a tenant, such as <code>acme</code>. It is never a display name and never reused after offboarding.</td></tr>
+<tr id='per-customer-deployment'><td><strong>Per-customer deployment</strong></td><td>The old model: each customer gets its own complete copy of all services, queues and databases. In this course it is the <code>LEGACY</code> placement.</td></tr>
+<tr id='multi-tenant-saas'><td><strong>Multi-tenant SaaS</strong></td><td>One running deployment (or a few) that serves many tenants at once.</td></tr>
+<tr id='tenancy-model'><td><strong>Tenancy model</strong></td><td>How the resources of one layer (DB, queues, compute) are shared between tenants: silo, pool, or bridge. <span class='cite'>[AWS-Fund]</span>, <span class='cite'>[Azure-MT *Tenancy models*]</span></td></tr>
+<tr id='silo'><td><strong>Silo</strong></td><td>A resource dedicated to one tenant, such as its own database or its own queue.</td></tr>
+<tr id='pool'><td><strong>Pool</strong></td><td>A resource shared by many tenants, such as one shared shard queue or one table holding several tenants' rows.</td></tr>
+<tr id='bridge'><td><strong>Bridge</strong></td><td>A system that mixes silo and pool in different layers, e.g. pooled compute and pooled queues but a siloed schema per tenant. (AWS term.) <span class='cite'>[AWS-Fund]</span>, <span class='cite'>[AWS-Iso]</span></td></tr>
+<tr id='tiering'><td><strong>Tiering</strong></td><td>Giving different tenants different placements or limits, usually by commercial tier. Example: large tenants get dedicated queues.</td></tr>
+<tr id='isolation'><td><strong>Isolation</strong></td><td>The guarantee that one tenant cannot read, change or disrupt another tenant's data or service. It is enforced, not just assumed. <span class='cite'>[AWS-Iso]</span></td></tr>
+<tr id='blast-radius'><td><strong>Blast radius</strong></td><td>How many tenants are hurt when one thing fails or one bug leaks.</td></tr>
+<tr id='control-plane'><td><strong>Control plane</strong></td><td>The services that manage tenants: registry, onboarding, offboarding, per-tenant config, billing, metrics. They are not tenant-facing business logic. <span class='cite'>[AWS-Fund]</span>, <span class='cite'>[Azure-MT *Control planes*]</span></td></tr>
+<tr id='application-plane'><td><strong>Application plane</strong></td><td>The services that do the tenant's actual work: in our pipeline, ingester, parser, enricher, rules, reporter.</td></tr>
+<tr id='tenant-registry'><td><strong>Tenant registry</strong></td><td>The control-plane record of every tenant and its placement (DB isolation, queue tier, source queue). In our system it is a file.</td></tr>
+<tr id='placement'><td><strong>Placement</strong></td><td>Where a tenant's resources live in one layer, e.g. <code>database.isolation=SCHEMA</code>, <code>queues.tier=SHARED</code>.</td></tr>
+<tr id='onboarding'><td><strong>Onboarding</strong></td><td>Creating a tenant: registry entry, schema or DB, queues, config, users.</td></tr>
+<tr id='offboarding'><td><strong>Offboarding</strong></td><td>Removing a tenant: stop traffic, export, delete data, remove registry entry.</td></tr>
+<tr id='tenant-context'><td><strong>Tenant context</strong></td><td>The tenant ID the current unit of work belongs to, held in memory while that work runs. In our services it is a <code>ThreadLocal</code> called <code>TenantContext</code>. <span class='cite'>[AWS-Fund]</span></td></tr>
+<tr id='trusted-edge'><td><strong>Trusted edge</strong></td><td>The one place where a tenant ID is *assigned* from evidence the system controls: the ingester (source queue) or the UI gateway (authenticated user). Everything after it only passes the ID on.</td></tr>
+<tr id='propagation'><td><strong>Propagation</strong></td><td>Carrying the tenant context across a boundary: JMS property, HTTP header, thread hop.</td></tr>
+<tr id='boundary'><td><strong>Boundary</strong></td><td>The point where work enters a service (JMS listener, HTTP filter, scheduler tick). The context is set there and cleared there.</td></tr>
+<tr id='fail-closed'><td><strong>Fail closed</strong></td><td>When the tenant is missing or unknown, refuse the work (retry, then DLQ, or HTTP 4xx). Never guess.</td></tr>
+<tr id='default-tenant'><td><strong>Default tenant</strong></td><td>A fallback tenant used when none is known. It is <strong>forbidden</strong> in this design, because it turns a missing-tenant bug into a cross-tenant leak.</td></tr>
+<tr id='startup-frozen-config'><td><strong>Startup-frozen config</strong></td><td>A per-customer setting read once at startup into a singleton field. It is wrong in a shared deployment, because it holds only one customer's value.</td></tr>
+<tr id='run-time-tenant-config'><td><strong>Run-time tenant config</strong></td><td>A per-tenant setting looked up for the current tenant context each time it is needed (usually through a cache keyed by tenant).</td></tr>
+<tr id='opt-in-flag'><td><strong>Opt-in flag</strong></td><td><code>multitenancy.enabled</code>. It defaults to <code>false</code>, so the old single-customer behaviour stays unless someone switches it on.</td></tr>
+<tr id='starter'><td><strong>Starter</strong></td><td>A Spring Boot library that ships auto-configuration, so adding the jar plus properties switches features on. <span class='cite'>[Boot-AC]</span></td></tr>
+</table>
+<h2>Day 2: Data isolation</h2>
+<table><tr><th>Term</th><th>Meaning</th></tr>
+<tr id='database-per-tenant'><td><strong>Database per tenant</strong></td><td>Data approach where each tenant has its own PostgreSQL database (silo). Registry value <code>DATABASE</code>.</td></tr>
+<tr id='schema-per-tenant'><td><strong>Schema per tenant</strong></td><td>Data approach where each tenant has its own schema inside a shared database (bridge-ish). Registry value <code>SCHEMA</code>.</td></tr>
+<tr id='shared-tables'><td><strong>Shared tables</strong></td><td>Data approach where all tenants share tables and each row carries a <code>tenant_id</code> column (pool).</td></tr>
+<tr id='discriminator-column'><td><strong>Discriminator column</strong></td><td>The <code>tenant_id</code> column in shared tables. Every query must filter on it.</td></tr>
+<tr id='row-level-security-rls'><td><strong>Row-level security (RLS)</strong></td><td>PostgreSQL feature: policies attached to a table that filter rows per session, e.g. by <code>current_setting('app.tenant_id')</code>. <span class='cite'>[PG-RLS]</span></td></tr>
+<tr id='search-path'><td><strong><code>search_path</code></strong></td><td>PostgreSQL session setting: the list of schemas searched for unqualified names. <span class='cite'>[PG-Client]</span></td></tr>
+<tr id='current-schema'><td><strong>Current schema</strong></td><td>The first *existing* schema in <code>search_path</code>. New unqualified objects are created there. <span class='cite'>[PG-Schemas]</span></td></tr>
+<tr id='borrow-time-switch'><td><strong>Borrow-time switch</strong></td><td>Setting <code>search_path</code> (or RLS setting) every time a connection is borrowed from the pool, not once at connection creation.</td></tr>
+<tr id='routing-data-source'><td><strong>Routing data source</strong></td><td>A <code>DataSource</code> that picks a target <code>DataSource</code> per call based on the current tenant (Spring's <code>AbstractRoutingDataSource</code> pattern).</td></tr>
+<tr id='pool-per-database'><td><strong>Pool per database</strong></td><td>One HikariCP pool for each physical database. Needed for <code>DATABASE</code> tenants.</td></tr>
+<tr id='stale-context-connection'><td><strong>Stale-context connection</strong></td><td>A pooled connection still carrying the previous tenant's <code>search_path</code> or setting. It causes a leak if it is not reset on borrow.</td></tr>
+<tr id='connection-leak'><td><strong>Connection leak</strong></td><td>A connection borrowed and never returned. With a stale context, the damage is worse.</td></tr>
+<tr id='migration-fan-out'><td><strong>Migration fan-out</strong></td><td>Running the same schema migration once for every tenant schema or database.</td></tr>
+<tr id='tenant-scoped-key'><td><strong>Tenant-scoped key</strong></td><td>A cache, lock or map key that includes the tenant ID. Required for all shared in-memory state.</td></tr>
+<tr id='noisy-neighbour'><td><strong>Noisy neighbour</strong></td><td>One tenant's load degrading service for other tenants who share a resource. <span class='cite'>[Azure-MT *Noisy Neighbor antipattern*]</span></td></tr>
+</table>
+<h2>Day 3: Messaging and context propagation</h2>
+<table><tr><th>Term</th><th>Meaning</th></tr>
+<tr id='virtual-topic'><td><strong>Virtual topic</strong></td><td>ActiveMQ Classic feature: producers send to a topic; each logical subscriber gets its own *consumer queue* that copies the topic. <span class='cite'>[AMQ-VD]</span></td></tr>
+<tr id='consumer-queue'><td><strong>Consumer queue</strong></td><td>The queue behind a virtual topic for one subscriber, named like <code>Consumer.&lt;name&gt;.VirtualTopic.&lt;topic&gt;</code> by default. <span class='cite'>[AMQ-VD]</span></td></tr>
+<tr id='shard-queue'><td><strong>Shard queue</strong></td><td>One of N shared queues for pooled tenants, e.g. <code>PARSE.shard-2</code>.</td></tr>
+<tr id='shard-count-n'><td><strong>Shard count (N)</strong></td><td>The number of shard queues. Tenants are placed by <code>floorMod(hash(tenantId), N)</code>.</td></tr>
+<tr id='one-way-door'><td><strong>One-way door</strong></td><td>A decision that is costly or impossible to reverse cheaply. Changing N is one.</td></tr>
+<tr id='consistent-hashing'><td><strong>Consistent hashing</strong></td><td>A hashing scheme in which changing the number of buckets moves only about 1/N of keys, instead of almost all of them.</td></tr>
+<tr id='hot-shard'><td><strong>Hot shard</strong></td><td>A shard queue that carries far more load than the others, usually because a big tenant hashes there.</td></tr>
+<tr id='dedicated-queue'><td><strong>Dedicated queue</strong></td><td>A queue for one tenant (silo tier), e.g. <code>PARSE.globex</code>.</td></tr>
+<tr id='message-group'><td><strong>Message group</strong></td><td>ActiveMQ Classic feature: messages with the same <code>JMSXGroupID</code> go to one consumer at a time, so they are processed in order. <span class='cite'>[AMQ-MG]</span></td></tr>
+<tr id='broadcast-message'><td><strong>Broadcast message</strong></td><td>A message that belongs to no single tenant (e.g. a reference-data refresh). It must be fanned out per tenant, with the context set for each.</td></tr>
+<tr id='poison-message'><td><strong>Poison message</strong></td><td>A message that fails every time it is processed.</td></tr>
+<tr id='redelivery-policy'><td><strong>Redelivery policy</strong></td><td>The rules for retrying a failed message: count, delay, back-off. <span class='cite'>[AMQ-RD]</span></td></tr>
+<tr id='dead-letter-queue-dlq'><td><strong>Dead-letter queue (DLQ)</strong></td><td>Where a message goes after it runs out of redeliveries. It is our fail-closed path. <span class='cite'>[AMQ-RD]</span></td></tr>
+<tr id='thread-hop'><td><strong>Thread hop</strong></td><td>Any point where work moves to another thread: <code>@Async</code>, executor, scheduler, <code>CompletableFuture</code>, Reactor operator. The <code>ThreadLocal</code> does not follow by itself.</td></tr>
+<tr id='task-decorator'><td><strong>Task decorator</strong></td><td>A Spring <code>TaskDecorator</code> that wraps a <code>Runnable</code> to capture context on the submitting thread and restore it on the worker. <span class='cite'>[Spring-Task]</span></td></tr>
+<tr id='context-snapshot'><td><strong>Context snapshot</strong></td><td>Micrometer's captured copy of registered <code>ThreadLocal</code> values, restored on another thread. <span class='cite'>[Micrometer-CP]</span></td></tr>
+<tr id='threadlocalaccessor'><td><strong><code>ThreadLocalAccessor</code></strong></td><td>Micrometer interface that tells the library how to read, set and reset one <code>ThreadLocal</code>. <span class='cite'>[Micrometer-CP]</span></td></tr>
+<tr id='automatic-context-propagation'><td><strong>Automatic context propagation</strong></td><td>Reactor mode (<code>Hooks.enableAutomaticContextPropagation()</code>) that restores registered <code>ThreadLocal</code>s around operators. <span class='cite'>[Reactor-CP]</span></td></tr>
+<tr id='outbound-propagation'><td><strong>Outbound propagation</strong></td><td>Adding <code>X-Tenant-Id</code> to every internal REST call through an interceptor on the client builder.</td></tr>
+</table>
+<h2>Day 4: The edge, operations and testing</h2>
+<table><tr><th>Term</th><th>Meaning</th></tr>
+<tr id='bff-backend-for-frontend'><td><strong>BFF (Backend for Frontend)</strong></td><td>The UI gateway: a server-side component that the browser talks to, which holds the OIDC session and calls internal services.</td></tr>
+<tr id='tenant-resolution'><td><strong>Tenant resolution</strong></td><td>Working out the tenant at the trusted edge: from the source queue (ingester) or the authenticated identity (BFF).</td></tr>
+<tr id='tenant-claim'><td><strong>Tenant claim</strong></td><td>A claim in the ID or access token, or a user→tenant mapping, that the BFF uses for tenant resolution.</td></tr>
+<tr id='header-stripping'><td><strong>Header stripping</strong></td><td>Removing any client-sent <code>X-Tenant-Id</code> before it can be read. Or rejecting the request.</td></tr>
+<tr id='lenient-filter'><td><strong>Lenient filter</strong></td><td>An anti-pattern: a filter that copies a client-sent tenant header into the context "if present".</td></tr>
+<tr id='idor'><td><strong>IDOR</strong></td><td>Insecure Direct Object Reference: accessing another tenant's object by changing an ID the server trusted. A kind of OWASP A01 Broken Access Control. <span class='cite'>[OWASP-A01]</span></td></tr>
+<tr id='quota'><td><strong>Quota</strong></td><td>A per-tenant limit on total use over a period (messages per day, storage). <span class='cite'>[SRE-Overload]</span></td></tr>
+<tr id='rate-limit'><td><strong>Rate limit</strong></td><td>A per-tenant limit on requests or messages per second.</td></tr>
+<tr id='bulkhead'><td><strong>Bulkhead</strong></td><td>Separate resources (pools, consumers, queues) so one tenant's failure or load cannot drain everyone's.</td></tr>
+<tr id='load-shedding'><td><strong>Load shedding</strong></td><td>Deliberately rejecting some work when overloaded, so the rest can succeed. <span class='cite'>[SRE-Overload]</span></td></tr>
+<tr id='mdc'><td><strong>MDC</strong></td><td>SLF4J Mapped Diagnostic Context: a per-thread map copied into log lines. It is itself a <code>ThreadLocal</code>.</td></tr>
+<tr id='cardinality'><td><strong>Cardinality</strong></td><td>The number of distinct values of a metric tag. With 300+ tenants, <code>tenant</code> as a tag multiplies time series.</td></tr>
+<tr id='leak-test'><td><strong>Leak test</strong></td><td>A test with two tenants holding the *same* business keys, which asserts that neither sees the other's data.</td></tr>
+<tr id='forged-header-test'><td><strong>Forged-header test</strong></td><td>A test that sends a fake <code>X-Tenant-Id</code> from the browser side and asserts it is rejected or ignored.</td></tr>
+<tr id='missing-tenant-test'><td><strong>Missing-tenant test</strong></td><td>A test that sends work with no tenant and asserts rejection (DLQ or 4xx), never a default.</td></tr>
+</table>
+</main></body></html>

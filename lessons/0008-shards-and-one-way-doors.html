@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shards and one-way doors</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 8 of 13 · Day 3 · ~25 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Shards and one-way doors</h1>
+<p class="win"><strong>Your win:</strong> compute a tenant's shard correctly, show why changing N moves most tenants, and keep per-key order in a shared queue.</p>
+
+<section class="recall">
+<h2>Recall first (3 min): Days 1–2, interleaved</h2>
+<ol><li>Why does <code>@Cacheable</code> leak across tenants by default?</li><li>Which evidence does the ingester use to assign a tenant?</li><li>What does <code>SET LOCAL</code> do under auto-commit?</li></ol>
+<details><summary>Check</summary><ol><li>The default key is built from method parameters only. (<a href="0007-caches-locks-and-maps.html">Lesson 7</a>)</li><li>The source queue the message arrived on. (<a href="0002-tenant-context-four-rules.html">Lesson 2</a>)</li><li>Nothing: it only warns. (<a href="0005-search-path-traps.html">Lesson 5</a>)</li></ol></details>
+</section>
+
+<h2>Destinations that separate traffic</h2>
+<pre class="diagram">
+ SHARED (pool tier)                              DEDICATED (silo tier)
+ VirtualTopic.TRADE_PARSED.shard-0..3            VirtualTopic.TRADE_PARSED.globex
+   -> Consumer.enricher.VirtualTopic.TRADE_PARSED.shard-2
+   -> Consumer.reporter.VirtualTopic.TRADE_PARSED.shard-2
+</pre>
+<p>One <code>destination(stage, tenantId)</code> function, used by every producer, picks <code>shard-k</code> or the <a href="../reference/glossary.html#dedicated-queue">dedicated queue</a> from the registry. Avoid one queue with a selector per tenant: it is hard to scale and to monitor. <span class="cite"><a href="https://activemq.apache.org/components/classic/documentation">ActiveMQ Classic docs: Virtual Destinations</a>.</span></p>
+
+<h2>Sharding: <code>floorMod(hashCode, N)</code></h2>
+<ul>
+<li><code>String.hashCode()</code> is specified in its javadoc, so it is identical on every JVM. Never use identity hashes.</li>
+<li>It can be negative. Java's <code>%</code> keeps the sign, so use <code>Math.floorMod(h, N)</code>.</li>
+<li><code>Math.abs(h) % N</code> is wrong twice: <code>Math.abs(Integer.MIN_VALUE)</code> is still negative, and for other negative hashes it disagrees with <code>floorMod</code>.</li>
+</ul>
+<div class="tool shard-calc" data-tenants="acme,globex,initech,umbrella,hooli,stark,polygenelubricants" data-n="4"></div>
+<p>Try N = 4 and N = 5, and look at the red cells and the "moves?" column.</p>
+
+<h2>Why N is a <a href="../reference/glossary.html#one-way-door">one-way door</a></h2>
+<pre class="diagram">
+ N=4: acme -> shard-2   | deploy N=5 |  acme -> shard-1
+ shard-2 still holds 10k acme messages;  new ones land on shard-1
+ consumers on BOTH process acme at once -> per-account order broken
+</pre>
+<p>With <code>mod N</code>, going to N+1 moves about N/(N+1) of keys. Message groups order only <em>within one queue</em>, so moving a tenant means draining its old shard first. Alternatives: <a href="../reference/glossary.html#consistent-hashing">consistent hashing</a> or jump consistent hash (only about 1/(N+1) of keys move), or <strong>store the shard in the registry</strong> at onboarding and never recompute it.</p>
+
+<h2>Message groups in a shared queue</h2>
+<pre><code>m.setStringProperty("JMSXGroupID", tenantId + ":" + trade.accountNo());   // not just accountNo</code></pre>
+<p>The broker sends a group to one consumer at a time. Using only <code>accountNo</code> couples tenants that share account numbers. Using only <code>tenantId</code> serialises a whole big tenant. <span class="cite"><a href="https://activemq.apache.org/components/classic/documentation">ActiveMQ Classic docs: Message Groups</a>.</span></p>
+
+<h2>Practice (8 min)</h2>
+<p>Use the calculator above for the facts; the quiz checks the reasoning.</p>
+<script type="application/json" class="quiz-data">
+[
+ {"q": "Which approach maps a tenant to one of N shards correctly in Java?",
+  "options": ["abs of hashCode modulo the count", "hashCode remainder cast to a long", "floorMod of hashCode and the count", "identity hash code modulo shard count"],
+  "answer": 2, "why": "floorMod is always in [0, N). abs fails for Integer.MIN_VALUE and disagrees with floorMod for negative hashes; identity hashes differ per JVM."},
+ {"q": "N goes from 4 to 5 with mod N. Roughly what share of tenants move?",
+  "options": ["About a fifth of tenants", "None, because hashCode is stable", "Exactly half of all tenants", "About four fifths of tenants"],
+  "answer": 3, "why": "A key stays put only if h mod 4 equals h mod 5, which is about 1 in 5. So about 4/5 move. In the calculator, all six example tenants move."},
+ {"q": "JMSXGroupID = accountNo on a shared shard queue. What is the problem?",
+  "options": ["Tenants with equal accounts get coupled", "Group IDs must be numeric values", "The broker drops unmappable group IDs", "Message groups never work with sharding"],
+  "answer": 0, "why": "acme's and hooli's account 10001 are serialised together. Use tenantId:accountNo."},
+ {"q": "The two largest tenants both hash to shard-1. What is the best first move?",
+  "options": ["Raise N to redistribute the hashes", "Promote one to a dedicated queue", "Add per-tenant selectors on the shard", "Lower redelivery for the shared shard"],
+  "answer": 1, "why": "Tiering fixes a hot shard and moves one tenant (drained first). Raising N moves about 80% of everyone."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read ActiveMQ Classic's <em>Message Groups</em> and <em>Virtual Destinations</em> pages (<a href="https://activemq.apache.org/components/classic/documentation">documentation index</a>). Video: search <code>jump consistent hash</code> and <code>consistent hashing explained</code>. Watch for the fraction of keys that move.</p>
+
+<p class="ask">Ask me, for example: "Write the drain-and-move runbook for one tenant" or "Should we persist shard assignments in the registry?"</p>
+
+<nav class="pager"><span><a href="0007-caches-locks-and-maps.html">← Caches are data</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0009-dlq-and-broadcast-messages.html">Next: DLQ and broadcast →</a></span></nav>
+</main><script src="../assets/quiz.js"></script><script src="../assets/shard-calc.js"></script></body></html>

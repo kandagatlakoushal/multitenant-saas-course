@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The trusted edge: the UI gateway</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 11 of 13 · Day 4 · ~25 min · <a href="../MISSION.html">Mission</a></p>
+<h1>The trusted edge: the UI gateway</h1>
+<p class="win"><strong>Your win:</strong> build tenant resolution in the BFF (backend for frontend) from the logged-in user, reject forged headers, and recognise cross-tenant access as OWASP A01.</p>
+
+<section class="recall">
+<h2>Recall first (3 min): Days 1–3</h2>
+<ol><li>Name four thread hops that lose the <code>ThreadLocal</code>.</li><li>Which two edges assign a tenant in our pipeline?</li><li>Why is changing N a one-way door?</li></ol>
+<details><summary>Check</summary><ol><li><code>@Async</code>, executors, <code>CompletableFuture</code> without an executor, <code>parallelStream</code>, cache refresh, Reactor schedulers. (<a href="0010-thread-hops.html">Lesson 10</a>)</li><li>The ingester (source queue) and the UI gateway (authenticated user). (<a href="0002-tenant-context-four-rules.html">Lesson 2</a>)</li><li>About N/(N+1) of tenants move, which breaks ordering unless their old shards are drained. (<a href="0008-shards-and-one-way-doors.html">Lesson 8</a>)</li></ol></details>
+</section>
+
+<h2>Where the tenant comes from</h2>
+<pre class="diagram">
+ Browser: GET /api/trades/9001     X-Tenant-Id: globex   (forged)
+   -> Spring Security chain: session -> OidcUser -> AuthorizationFilter
+   -> TenantResolutionFilter (ours, AFTER authentication)
+        1. any client X-Tenant-Id?   -> 400 + security metric
+        2. tenant := directory(issuer, sub)   (or an IdP-owned claim)
+        3. none / unknown            -> 403
+        4. set context; finally clear
+   -> controller -> builder adds X-Tenant-Id: acme -> internal services
+</pre>
+<ul>
+<li>Get the tenant from an <a href="../reference/glossary.html#tenant-claim">IdP-owned claim</a> or a control-plane user→tenant mapping keyed by issuer and <code>sub</code>. Never from a user-editable profile field.</li>
+<li>Users in several tenants: the tenant is a choice, <em>checked against membership</em> on every request.</li>
+<li>Reject a client-sent header rather than strip it. Rejecting surfaces probing and old front-end code.</li>
+</ul>
+<p class="cite"><a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/considerations/map-requests">Azure: Map requests to tenants</a>.</p>
+<pre><code>http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+    .oauth2Login(Customizer.withDefaults())
+    .addFilterAfter(new TenantResolutionFilter(directory), AuthorizationFilter.class);</code></pre>
+<p><strong>Trap:</strong> don't make the filter a <code>@Component</code>. Boot registers every <code>Filter</code> bean with the servlet container, so it would also run <em>before</em> the security chain, before authentication. Either don't make it a bean, or disable its registration with <code>FilterRegistrationBean.setEnabled(false)</code>. <span class="cite"><a href="https://docs.spring.io/spring-security/reference/servlet/architecture.html">Spring Security: Servlet Architecture</a>.</span></p>
+
+<h2>The <a href="../reference/glossary.html#lenient-filter">lenient filter</a> and IDOR</h2>
+<pre><code>String t = req.getHeader("X-Tenant-Id");
+if (t != null) TenantContext.set(t); else TenantContext.set(directory.tenantFor(user));   // every user is every tenant</code></pre>
+<table>
+<tr><th>Form</th><th>Example</th><th>Defence</th></tr>
+<tr><td>Tenant IDOR</td><td>Forged header, <code>?tenant=</code>, tenant in the body</td><td>Tenant only from the authenticated identity</td></tr>
+<tr><td>Object IDOR</td><td><code>GET /trades/9001</code> owned by another tenant</td><td>Tenant-scoped lookups (schema or RLS). Return 404, not 403.</td></tr>
+</table>
+<p>Both are <a href="https://owasp.org/Top10/A01_2021-Broken_Access_Control/">OWASP A01 Broken Access Control</a> (insecure direct object references, CWE-639). It recommends deny by default and logging access failures. Internal services trust <code>X-Tenant-Id</code> only because the browser cannot reach them.</p>
+
+<h2>Practice (10 min)</h2>
+<p>Today the BFF reads <code>X-Customer</code> from the browser "for the admin view". Write the change list before checking.</p>
+<details><summary>Worked answer</summary><ul>
+<li>Remove <code>X-Customer</code> handling. Any client tenant header gets 400 and increments a security metric.</li>
+<li>Add <code>TenantResolutionFilter</code> after authentication, not as a bean, with fail-closed 403.</li>
+<li>Admin view: a separate role, switching only to tenants on that admin's allow-list, checked on every request, audited, and stored in the server-side session.</li>
+<li>Outbound calls carry <code>X-Tenant-Id</code> from the context through the builder. The reporter is not reachable from the browser.</li>
+<li>Object lookups are tenant-scoped and return 404.</li></ul></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "Where must the BFF get the tenant from?",
+  "options": ["The header the browser sends", "Identity of the signed-in user", "A tenant query string parameter", "The request body's tenant field"],
+  "answer": 1, "why": "The browser controls headers, query parameters and bodies. Only the authenticated identity is evidence."},
+ {"q": "The tenant filter is a @Component and is also added to the SecurityFilterChain. What is the risk?",
+  "options": ["Spring Security refuses to start up", "It runs only for anonymous users", "It runs twice, once before auth", "Boot ignores it inside the chain"],
+  "answer": 2, "why": "Boot auto-registers Filter beans with the servlet container, so it also runs outside and before the security chain."},
+ {"q": "A user of tenant A requests /trades/9001, which belongs to tenant B (schema per tenant). Response?",
+  "options": ["200, returning tenant B's trade", "403, confirming the trade exists", "500, from a schema error", "404, as though it's absent"],
+  "answer": 3, "why": "In A's schema, trade 9001 does not exist. A 404 doesn't confirm that it exists elsewhere."},
+ {"q": "The filter uses a client header if present, otherwise the directory. What is the effect?",
+  "options": ["Any user can impersonate any tenant", "Only admins can switch their tenants", "Requests without the header are rejected", "Internal callers lose the tenant context"],
+  "answer": 0, "why": "This is the lenient-filter anti-pattern: one forged header and any logged-in user acts as another tenant."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read <a href="https://docs.spring.io/spring-security/reference/servlet/architecture.html">Spring Security: Servlet Architecture</a> (filter chain, ordering, adding a filter), then <a href="https://owasp.org/Top10/A01_2021-Broken_Access_Control/">OWASP A01</a>. Video: search <code>Spring Security architecture filter chain</code> (Spring I/O).</p>
+
+<p class="ask">Ask me, for example: "How do we model consultants who belong to three tenants?" or "Show the full filter class with tests."</p>
+
+<nav class="pager"><span><a href="0010-thread-hops.html">← Thread hops</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0012-noisy-neighbours-observability-lifecycle.html">Next: Operations →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

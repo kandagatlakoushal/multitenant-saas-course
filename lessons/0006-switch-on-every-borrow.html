@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switch on every borrow</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 6 of 13 · Day 2 · ~25 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Switch on every borrow</h1>
+<p class="win"><strong>Your win:</strong> write the data-source wrapper that sets the tenant on every connection borrow, combine it with routing, and check that the connection numbers add up.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>Which survives returning a connection to the pool: <code>SET</code> or <code>SET LOCAL</code>?</li><li>A tenant's schema doesn't exist and the path includes <code>public</code>. What happens?</li></ol>
+<details><summary>Check</summary><ol><li><code>SET</code> (session scope). <code>SET LOCAL</code> ends with the transaction. (<a href="0005-search-path-traps.html">Lesson 5</a>)</li><li>The query silently reads <code>public</code>: a leak.</li></ol></details>
+</section>
+
+<h2>Why every borrow</h2>
+<pre class="diagram">
+ pool --> borrow [conn: path=t_acme] --> hooli's query --> return [path=t_acme]
+          (left by the last user)        reads t_acme       Hikari doesn't reset SQL-level SET
+</pre>
+<ul>
+<li>HikariCP's <code>connectionInitSql</code> runs <strong>once per physical connection</strong>, not per borrow.</li>
+<li>Hikari resets state changed through the JDBC API (auto-commit, isolation, read-only, catalog, schema) when a connection returns. It cannot know about a <code>SET</code> you ran as SQL. <span class="unverified">⚠ verify the exact reset list for your version</span></li>
+</ul>
+<p class="cite"><a href="https://github.com/brettwooldridge/HikariCP">HikariCP README</a>.</p>
+<pre><code>public class TenantSchemaDataSource extends DelegatingDataSource {
+    @Override
+    public Connection getConnection() throws SQLException {
+        String schema = registry.requireSchemaFor(TenantContext.require());   // validated, fail closed
+        Connection c = super.getConnection();
+        try (PreparedStatement ps = c.prepareStatement("SELECT set_config('search_path', ?, false)")) {
+            ps.setString(1, schema);                                           // tenant schema only, no public
+            ps.execute();
+        } catch (SQLException e) { c.close(); throw e; }
+        return c;
+    }
+}</code></pre>
+<p>This runs before Spring starts the transaction (the transaction manager turns off auto-commit <em>after</em> getting the connection). So a rollback cannot undo the <code>SET</code>. Alternative: <code>c.setSchema(schema)</code>, which Hikari tracks and resets on return. <span class="unverified">⚠ verify how pgJDBC implements setSchema</span>. For RLS, set <code>app.tenant_id</code> the same way.</p>
+
+<h2>Routing between databases</h2>
+<pre class="diagram">
+ getConnection()
+   -> TenantRoutingDataSource           which DATABASE, by registry placement
+        "shared-1"  -> TenantSchemaDataSource -> Hikari(shared-1)   SET path per borrow
+        "db_globex" -> Hikari(globex)                               no switch needed
+</pre>
+<p><code>AbstractRoutingDataSource</code> falls back to its <strong>default target</strong> when the key is null, or when the key is unknown and <code>lenientFallback</code> is <code>true</code> (the default). That is a default tenant by another name. Don't set a default target, and call <code>setLenientFallback(false)</code>. <span class="cite"><a href="https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/jdbc/datasource/lookup/AbstractRoutingDataSource.html">Javadoc</a>.</span></p>
+
+<h2>Connection arithmetic</h2>
+<p><code>connections to one server = pods × pools on that server × maximumPoolSize</code>. PostgreSQL's default <code>max_connections</code> is 100. Keep pools small (see the <a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing">pool sizing wiki</a>), or give database-per-tenant tenants their own servers. With PgBouncer in transaction mode, a session <code>SET</code> can leak between clients <span class="unverified">⚠ check the PgBouncer docs</span>.</p>
+
+<h2>Migrations across hundreds of schemas</h2>
+<p>Run Liquibase as a <strong>separate job</strong>, not at app startup. Run it in batches, recording success or failure per tenant. Use <strong>expand → migrate → contract</strong>, because for a while some tenants are on the new schema and some on the old, and the code must work with both. One failed tenant is recorded and alerted on, and doesn't stop the others.</p>
+
+<h2>Practice (10 min)</h2>
+<h3>Review this bean</h3>
+<pre><code>@Bean
+DataSource dataSource(TenantRegistry registry) {
+    HikariConfig cfg = new HikariConfig();
+    cfg.setJdbcUrl("jdbc:postgresql://pg-shared-1/app");
+    cfg.setConnectionInitSql("SET search_path TO "
+        + registry.schemaFor(TenantContext.current().orElse("public")));
+    return new HikariDataSource(cfg);
+}</code></pre>
+<details><summary>Worked answer</summary><ol>
+<li>Init SQL runs once per physical connection, so tenants are never switched.</li>
+<li>The bean is built at startup, where there is no tenant. So every connection gets <code>public</code> (or whatever <code>schemaFor("public")</code> returns): a <strong>default tenant</strong>.</li>
+<li>String concatenation into SQL.</li></ol>
+<p>Fix: a plain pool wrapped by <code>TenantSchemaDataSource</code>, using <code>require()</code>, a registry-validated schema, and <code>set_config</code> with a parameter.</p></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "Why doesn't connectionInitSql suit per-tenant search_path switching?",
+  "options": ["It runs once per borrowing thread", "It cannot execute SET in PostgreSQL", "It runs after the transaction starts", "It runs once per physical connection"],
+  "answer": 3, "why": "A physical connection lives for minutes and serves many tenants. You must switch on every borrow."},
+ {"q": "A routing data source has a default target and lenientFallback left at its default. The tenant key is unknown. What happens?",
+  "options": ["It throws an exception right away", "It routes to the default target", "It opens a fresh connection pool", "It waits for a registry reload"],
+  "answer": 1, "why": "Lenient fallback plus a default target means a default tenant. Remove the default and set lenientFallback(false)."},
+ {"q": "6 pods, 40 database-per-tenant pools on one server, maximumPoolSize 10. How many connections?",
+  "options": ["2,400 connections, far beyond the default", "60 connections, within the default limit", "400 connections, four times the default", "6,000 connections, sixty times the default"],
+  "answer": 0, "why": "6 × 40 × 10 = 2,400, against a default max_connections of 100. Shrink the pools or move tenants to other servers."},
+ {"q": "Why use expand, migrate, contract for tenant schema migrations?",
+  "options": ["Liquibase needs it for schema locking", "Code must support both schema versions", "PostgreSQL forbids drops during any deploy", "Each tenant picks its schema version"],
+  "answer": 1, "why": "Tenants migrate at different times, so the deployed code meets both schema versions."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read the <a href="https://github.com/brettwooldridge/HikariCP">HikariCP README</a> (configuration and the "dirty state" reset behaviour), then the <a href="https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing">About Pool Sizing</a> wiki page. Video: search <code>HikariCP pool sizing</code>.</p>
+
+<p class="ask">Ask me, for example: "Should we also reset the path when a connection is returned?" or "How do I run Liquibase per schema from a job?"</p>
+
+<nav class="pager"><span><a href="0005-search-path-traps.html">← search_path traps</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0007-caches-locks-and-maps.html">Next: Caches are data →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenant context: the four rules</title>
+<link rel="stylesheet" href="../assets/course.css"></head>
+<body><main>
+<p class="kicker">Lesson 2 of 13 · Day 1 · ~25 min · <a href="../MISSION.html">Mission</a></p>
+<h1>Tenant context: the four rules</h1>
+<p class="win"><strong>Your win:</strong> trace a message through the pipeline and point at every place where the tenant identity is lost, taken from an untrusted source, or guessed.</p>
+
+<section class="recall">
+<h2>Recall first (2 min)</h2>
+<ol><li>Describe <code>acme</code>'s placement as three per-layer answers. What is the overall model?</li>
+<li>Name one control-plane and one application-plane component in our pipeline.</li></ol>
+<details><summary>Check</summary><ol>
+<li>Compute pool, queues pool (shard), database schema on a pooled server: bridge. (<a href="0001-silo-pool-bridge-per-layer.html">Lesson 1</a>)</li>
+<li>Control plane: registry, onboarding, offboarding, per-tenant config. Application plane: ingester, parser, enricher, rules, reporter.</li></ol></details>
+</section>
+
+<h2>The four rules</h2>
+<pre class="diagram">
+  TRUSTED EDGE             PROPAGATION                         USE
+  (assign once)            (pass on, never re-derive)
+
+  IN.ACME --> INGESTER --JMS prop tenantId=acme--> PARSER --JMS--> ENRICHER --REST--> REFDATA
+             registry:                               |                   X-Tenant-Id: acme
+             queue -> tenant                 boundary: set / finally clear
+                                                     |
+                                          ThreadLocal TenantContext
+                                          -> DB borrow, cache keys, outbound copies
+</pre>
+<ol>
+<li><strong>Assign once, at the <a href="../reference/glossary.html#trusted-edge">trusted edge</a>.</strong> The ingester takes the tenant only from the <em>queue</em> the message arrived on, because you control which credentials can write to <code>IN.ACME</code>. A <code>tenantId</code> inside the message is customer-controlled: overwrite it.</li>
+<li><strong>Pass it on, never re-derive it.</strong> Use the JMS property <code>tenantId</code> between services and the header <code>X-Tenant-Id</code> on internal REST calls. Don't recompute it from an account number. Business keys repeat across tenants.</li>
+<li><strong>Hold it in a <code>ThreadLocal</code>.</strong> Set it at the <a href="../reference/glossary.html#boundary">boundary</a> and clear it in <code>finally</code>. Listener and servlet threads are pooled.</li>
+<li><strong><a href="../reference/glossary.html#fail-closed">Fail closed</a>, with no <a href="../reference/glossary.html#default-tenant">default tenant</a>.</strong> A missing or unknown tenant means throw, roll back, redeliver, then dead-letter queue (DLQ).</li>
+</ol>
+<p class="note">JMS property names must be valid Java identifiers (JMS specification, <em>Message Properties</em>). <code>tenantId</code> is legal; <code>X-Tenant-Id</code> is not.</p>
+
+<h3>The code</h3>
+<pre><code>public final class TenantContext {
+    private static final ThreadLocal&lt;String&gt; CURRENT = new ThreadLocal&lt;&gt;();
+    public static void set(String id) {
+        if (id == null || id.isBlank()) throw new MissingTenantException();
+        String existing = CURRENT.get();
+        if (existing != null &amp;&amp; !existing.equals(id))      // previous task didn't clear: loud, not silent
+            throw new IllegalStateException("Tenant already set to " + existing);
+        CURRENT.set(id);
+    }
+    public static String require() {
+        String t = CURRENT.get();
+        if (t == null) throw new MissingTenantException();
+        return t;
+    }
+    public static Optional&lt;String&gt; current() { return Optional.ofNullable(CURRENT.get()); }
+    public static void clear() { CURRENT.remove(); }        // remove(), not set(null)
+}
+
+@JmsListener(destination = "PARSE.shard-${parser.shard}")
+public void onMessage(Message m) throws JMSException {
+    String tenantId = m.getStringProperty("tenantId");
+    registry.requireKnown(tenantId);                       // null/unknown -&gt; throw -&gt; redelivery -&gt; DLQ
+    TenantContext.set(tenantId);
+    try { parser.handle(m); }
+    finally { TenantContext.clear(); }
+}
+
+// Every outbound send copies it:
+jmsTemplate.convertAndSend(dest, payload, msg -&gt; {
+    msg.setStringProperty("tenantId", TenantContext.require());
+    return msg;
+});</code></pre>
+<p>The ingester binds the tenant to the <em>endpoint</em>, not to the message. It registers one listener per registry entry with <code>JmsListenerConfigurer</code>, and passes the tenant ID from the registry into the handler. Whether a thrown exception actually causes redelivery depends on <code>sessionTransacted</code> on your listener container <span class="unverified">⚠ verify for your Boot version</span>.</p>
+
+<h2>Practice (12 min): find the leaks</h2>
+<p>Read this five-service sketch. Mark every point where identity is lost, comes from an untrusted source, or is guessed. Write your list, then check.</p>
+<pre><code>[1] INGESTER  @JmsListener(destination = "IN.ALL")                    // one queue for all customers
+              t = m.getStringProperty("tenantId");                      // sent by the customer
+              jms.convertAndSend("PARSE.shard-" + shard(t), body(m));   // no post-processor
+[2] PARSER    set(m.tenantId) ... convertAndSend("ENRICH", tr, copyTenant()) ... finally clear()
+[3] ENRICHER  RestTemplate rt = new RestTemplate();                     // interceptor is on the builder bean
+              rt.getForObject(refUrl + "/instruments/" + isin, Ref.class);
+[4] RULES     t = accounts.ownerTenantOf(trade.accountNo()); set(t);
+[5] REPORTER  t = Optional.ofNullable(m.tenantId).orElse("default"); set(t);</code></pre>
+<details><summary>Worked answer</summary>
+<ul>
+<li><strong>[1] Wrong edge.</strong> A shared inbound queue no longer identifies the customer, and the code trusts a customer-sent property. Any customer can inject trades into another tenant. Fix: per-customer source queues, tenant from the registry, overwrite any incoming property.</li>
+<li><strong>[1] Not copied.</strong> The send has no post-processor, so the parser receives no tenant.</li>
+<li><strong>[3] Not copied.</strong> <code>new RestTemplate()</code> bypasses the builder's interceptors, so no <code>X-Tenant-Id</code> is sent. (<a href="0010-thread-hops.html">Lesson 10</a>.)</li>
+<li><strong>[4] Re-derived.</strong> Account numbers are not unique across tenants, so this fails intermittently and depends on the data.</li>
+<li><strong>[5] Default tenant.</strong> Lost context silently lands in one tenant's reports.</li>
+</ul>
+<p>The pattern: identity is lost when it is <em>not copied</em>, <em>taken from an untrusted source</em>, or <em>recomputed or defaulted</em>.</p></details>
+
+<script type="application/json" class="quiz-data">
+[
+ {"q": "Where does the ingester get the tenant ID for an inbound message?",
+  "options": ["From the property the customer sent", "From the queue it arrived on", "From a field in the payload", "From the account number it carries"],
+  "answer": 1, "why": "The source queue is under your control (registry mapping plus broker authorization). Everything inside the message is customer-controlled."},
+ {"q": "The parser receives a message with no tenantId property. What should happen?",
+  "options": ["Process it under the default tenant", "Process it, logging a warning instead", "Acknowledge it and silently drop it", "Throw, so it retries, then DLQs"],
+  "answer": 3, "why": "Fail closed: throw, roll back, redeliver a few times, then DLQ with an alert. A missing tenant is always an upstream bug."},
+ {"q": "Why is X-Tenant-Id a bad name for the tenant JMS property?",
+  "options": ["JMS property names must be identifiers", "JMS properties may only hold numbers", "JMS reserves every X- prefixed name", "ActiveMQ strips names that contain dashes"],
+  "answer": 0, "why": "JMS property names follow Java identifier rules, and a dash is not allowed. Use tenantId in JMS and X-Tenant-Id in HTTP."}
+]
+</script>
+
+<h2>Primary source</h2>
+<p>Read the tenant context and identity sections of <a href="https://docs.aws.amazon.com/whitepapers/latest/saas-architecture-fundamentals/saas-architecture-fundamentals.html">AWS: SaaS Architecture Fundamentals</a>. Then read Azure's <a href="https://learn.microsoft.com/azure/architecture/guide/multitenant/considerations/map-requests">Map requests to tenants</a> for the HTTP side.</p>
+
+<p class="ask">Ask me follow-ups, for example: "Should the ingester ever accept a tenant from a message?" or "Show me the JmsListenerConfigurer version of the ingester."</p>
+
+<nav class="pager"><span><a href="0001-silo-pool-bridge-per-layer.html">← Silo, pool, bridge</a></span><span><a href="../reference/glossary.html">Glossary</a> · <a href="../reference/cheat-sheet.html">Cheat sheet</a></span><span><a href="0003-frozen-config-and-starter-switches.html">Next: Frozen config →</a></span></nav>
+</main><script src="../assets/quiz.js"></script></body></html>
